@@ -1,0 +1,86 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+.verl/
+verl_sandbox/
+
+# =========================
+# Model weights
+# =========================
+meta-llama/
+sft/Llama*/
+checkpoints/
+
+# =========================
+# Training outputs
+# =========================
+outputs/
+outputs_random/
+
+trl_grpo_gsm8k_600_final/
+trl_grpo_gsm8k_final/
+trl_grpo_gsm8k_full_set_final/
+trl_grpo_gsm8k_full_set_output/
+trl_grpo_gsm8k_full_set_output_2/
+trl_grpo_gsm8k_full_set_outputs/
+
+# =========================
+# Weights & checkpoints
+# =========================
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# =========================
+# Logs
+# =========================
+*.log
+out
+out*
+a.log
+run.log
+wandb/
+
+# =========================
+# Evaluation results
+# =========================
+*.json
+*.jsonl
+results/
+predictions/
+eval_outputs/
+
+# Uncomment if you want to keep only configs
+# !config*.json
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Ray
+# =========================
+ray_results/
