@@ -12,6 +12,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from functools import partial
+import time
 from util.entropy_processor import EntropyStopperAdapter
 
 from typing import List
@@ -28,6 +29,8 @@ from util.get_logits import get_shift_logits_and_labels
 from util.entropy import calculate_entropy_from_logits
 from util.ratio import get_ratio
 from util.debug import debug
+
+from opsd.opsd import OPSD
 
 
 
@@ -53,10 +56,10 @@ ray.init(
     _temp_dir=os.environ["RAY_TMPDIR"],
     include_dashboard=False,
     num_cpus=8,
-    num_gpus=3,
+    num_gpus=4,
 )
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=2)
 class RolloutActor(AbstractRolloutWeightSync):
     def __init__(self, gpu_ids:List[str], model_path:str):
         self._init_rollout_weight_sync_state()
@@ -75,6 +78,7 @@ class RolloutActor(AbstractRolloutWeightSync):
             logits_processors=[EntropyStopperAdapter],
             #enforce_eager=True,
             weight_transfer_config=WeightTransferConfig(backend="nccl"),
+            disable_custom_all_reduce=True,
         )
         debug("VLLM LOADED")
         
@@ -84,8 +88,18 @@ class RolloutActor(AbstractRolloutWeightSync):
         
         debug("TOKENIZER LOADED")
 
+    def generate(self, prompts, ground_truths, reference_answers):
+        # Re-run genrate until it success in case it crashes
+        while True:
+            try:
+                return self._generate(prompts, ground_truths, reference_answers)
+            except Exception as e:
+                debug("Rollout crashed, retrying...")
+                debug(e)
+                torch.cuda.empty_cache()
+                time.sleep(1)  # Wait a bit before retrying
         
-    def generate(self, prompts, ground_truths) -> TreeRewardManager:
+    def _generate(self, prompts, ground_truths, reference_answers) -> TreeRewardManager:
         # Get text
         applied_template_prompts = self.tokenizer.apply_chat_template(
             prompts,
@@ -126,7 +140,7 @@ class RolloutActor(AbstractRolloutWeightSync):
             "input_ids": input_ids,
             "group_ids": group_ids,
             "thresholds": [2] * len(prompts) # at first entropy threshold is 2
-        }, depths=depths, gts=ground_truths, groups=groups, is_init=True)
+        }, depths=depths, gts=ground_truths, groups=groups, reference_answers=reference_answers, is_init=True)
         
         debug("#"*80)
         debug("DONE GENERATING")
@@ -322,10 +336,56 @@ class FSDPTrainerActor(AbstractFSDPWeightSync):
                 device=device,
                 dtype=dtype,
             )
+            
+            h_target_ratio = torch.tensor(
+                [x["h_target_ratio"] for x in mini_batch],
+                device=device,
+                dtype=dtype,
+            )
+            teacher_prefixes = [
+                torch.as_tensor(
+                    x["teacher_prefix"],
+                    device=device,
+                    dtype=torch.long,   # token IDs
+                )
+                for x in mini_batch
+            ]
+            
+            
+            
+            debug("H target")
+            debug(H_targets.shape)
+            with torch.no_grad():
+                _h_targets = OPSD.calculate_entropy_of_teacher(
+                    hf_model = self.model,
+                    sequences = input_ids,
+                    reward_masks = reward_masks,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    teacher_prefixes =  teacher_prefixes
+                )
+            ''' 
+            debug("H Target Ratio:")
+            debug(h_target_ratio)
+            debug(len(h_target_ratio))
+            debug("H Target:")
+            debug(_h_targets.shape)
+            debug(_h_targets[1])
+            debug("Entropy:")
+            debug(entropies[1])
+            debug(entropies.shape)
+            debug(masks[1])
+            '''
 
             base_advantages = correctness_advantages.unsqueeze(1)
-
-            entropy_penalty = (entropies - H_targets.unsqueeze(1)) # ** 2
+            
+            H_targets = h_target_ratio[:, None] * _h_targets
+            # entropy_penalty = (entropies - H_targets.unsqueeze(1)) # ** 2
+            
+            entropy_penalty = entropies - H_targets
+            
+            debug("entropy_penalty")
+            debug(_h_targets)
+            debug(entropy_penalty)
             
             multiplier = torch.clamp(
                 1.0 - self.alpha * entropy_penalty,
@@ -341,6 +401,12 @@ class FSDPTrainerActor(AbstractFSDPWeightSync):
             
             advantages = advantages * masks
             
+            '''
+            debug("advantages")
+            debug(advantages[1])
+            '''
+
+
             # [batch]
             min_advantages = torch.where(
                 masks.bool(),
@@ -506,9 +572,9 @@ class RLController(AbstractWeightSyncController):
         
         debug("="*30,"Trainer Loaded","="*30)
     
-    def rollout_samples(self, prompts, ground_truths):
+    def rollout_samples(self, prompts, ground_truths, reference_answers):
         return ray.get(self.rollout.generate.remote(
-            prompts, ground_truths
+            prompts, ground_truths, reference_answers
         ))
     
     def split_samples(self, manager:TreeRewardManager, input_ids):
@@ -545,8 +611,8 @@ class RLController(AbstractWeightSyncController):
 
         return losses
 
-    def step(self, prompts, ground_truths):
-        manager, input_ids, mean_reward = self.rollout_samples(prompts, ground_truths)
+    def step(self, prompts, ground_truths, reference_answers):
+        manager, input_ids, mean_reward = self.rollout_samples(prompts, ground_truths, reference_answers)
         losses = self.train_on_samples(manager=manager, input_ids=input_ids)
         
         return {

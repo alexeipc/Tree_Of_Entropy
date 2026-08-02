@@ -6,6 +6,8 @@ from util.debug import debug
 from util.reward_func import reward
 from tree_reward import TreeRewardManager
 from util.entropy_processor import EntropyStopper
+from util.opsd import change_prompts
+from opsd.opsd import OPSD
 from multiprocessing import shared_memory
 import numpy as np
 
@@ -18,7 +20,7 @@ class Tree:
         self.branching_threshold = branching_threshold
             
         
-        self.manager = tree_reward_manager
+        self.manager:TreeRewardManager = tree_reward_manager
         
         self.batch_size = batch_size
         
@@ -40,6 +42,9 @@ class Tree:
         
 
     def handle_single_completion(self, completion, prompt, input_ids, do_branching = True):
+        """
+            return: [<the token ids of the prompt + completions>, (<next prompts after branching>, <next token ids after branching>)]
+        """
         if do_branching:
             generated_token_ids = completion.token_ids[:-1]    
         else:
@@ -105,7 +110,7 @@ class Tree:
             # Very similar so should not branch
             return [next_ids, (next_prompt, next_ids)]
     
-    def forward(self, batch_messages, depths, gts, groups = {}, is_init = False):
+    def forward(self, batch_messages, depths, reference_answers, gts, groups = {}, is_init = False):
         debug(depths)
         
         prompts = batch_messages["text"]
@@ -186,19 +191,27 @@ class Tree:
         
         curr_node_ids = []
         relations = []
+        
+        # Collect teacher prompts
+        teacher_reference_answers = []
+        teacher_messages = []
+        teacher_gts = []
+        teacher_childs = []
+        teacher_n_branches = 0
                 
         for i, output in enumerate(outputs):
             # debug("+"*30,f"Prompt {i}","+"*30)
             completion = output.outputs[0]
             # debug(prompts[i] + completion.text)
             
-            # Stop before reaching the threshold, meaning that it reaches the eos
+            # Stop before reaching the threshold, meaning that it reaches the eos or tokens limit
             #completion = output.outputs[0]
 
             if stop_entropies[i] is None:
                 debug("HE"*40)
                 debug(completion.token_ids)
                 reward_score = reward(prompts[i] + completion.text, gts[group_ids[i]])
+                
                 debug(reward_score)
                 tmp = self.handle_single_completion(completion, prompts[i], input_ids[i], do_branching=False)
                 
@@ -229,7 +242,7 @@ class Tree:
                         child_ids = node_ids
                     )
                 
-                continue
+                continue                
             
             # Else start branching
             tmp = self.handle_single_completion(completion, prompts[i], input_ids[i])
@@ -245,6 +258,13 @@ class Tree:
             
             curr_node_ids.append(node_ids)
             node = self.manager.add_node(node_ids)
+            
+            # Save this for the teacher
+            teacher_reference_answers.append(reference_answers[group_ids[i]])
+            teacher_messages.append(prompts[i] + completion.text)
+            teacher_gts.append(gts[group_ids[i]])
+            # Len of curr_node_ids - 1 is the index of this node ids
+            teacher_childs.append(len(curr_node_ids) - 1)
 
             # Only consider to be a branch if the number of branch is larger than 2
             next_depth = depths[i] + (len(tmp) > 2)
@@ -321,7 +341,8 @@ class Tree:
                 self.forward(batch_messages=batch,
                              depths=next_depths[start_idx:end_idx],
                              gts=gts,
-                             groups=groups)
+                             groups=groups,
+                             reference_answers=reference_answers)
             )
             
         for parent, child in relations:
@@ -330,11 +351,50 @@ class Tree:
                 child_ids=next_node_ids[child]
             )
             
+            # Calculate the number of branches from the children's nodes
+            child_node = self.manager.add_node(next_node_ids[child])
+            child_node.count_branches()
+            
+            debug("CHILD NODE BRANCHES")
+            debug(child_node.n_branches)
+            teacher_n_branches = max(teacher_n_branches, child_node.n_branches)
             '''
             debug("o"*80)
             debug(curr_node_ids[parent])
             debug(next_node_ids[child])
             '''
+            
+        # Generate teacher's answers
+        #TODO: Calculate teacher_n_branches
+        #debug("TEACHER N BRANCHES")
+        #debug(teacher_n_branches)
+        
+        teacher_n_branches = 4
+        
+        OPSD.handle_batch(
+            vllm=self.llm,
+            teacher_messages = teacher_messages,
+            teacher_reference_answers=teacher_reference_answers,
+            teacher_n_branches=teacher_n_branches,
+            teacher_gts=teacher_gts,
+            manager=self.manager, 
+            input_ids=[curr_node_ids[i] for i in teacher_childs]
+        )
+        
+        # If it is init then add the teachers's prompts
+        if is_init:
+            #TODO: Calculate # of branches
+            OPSD.handle_batch(
+                vllm=self.llm,
+                # For init, teacher messages = prompts
+                teacher_messages=prompts,
+                teacher_reference_answers=teacher_reference_answers,
+                teacher_n_branches=teacher_n_branches,
+                # For init, gts are the same
+                teacher_gts=gts,
+                manager=self.manager,
+                input_ids=input_ids
+            )
             
         if is_init:
             Tree.normalize_group(groups=groups)

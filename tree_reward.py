@@ -23,9 +23,22 @@ class TreeRewardManager:
             self.manager = manager
             self.is_leaf = False
             self.advantage = None
+            self.teacher_ids = None
+            self.teacher_acc = None
+            self.small_delta = 0.2
+            
+            self.n_branches = 1
 
         def add_child(self, childNode):
             self.children.append(childNode)
+            
+        def count_branches(self):
+            # Is leaf node
+            if len(self.children) == 0:
+                self.n_branches = 1
+            else:
+                self.n_branches = sum(child.count_branches() for child in self.children)
+            return self.n_branches
 
         def __call__(self):
             if self.correct_answer + self.wrong_answer != 1:
@@ -51,8 +64,39 @@ class TreeRewardManager:
                 + (1 - success_rate)
                 * (self.manager.H_max - self.manager.H_min)
             )
+            
+            # Calculate the H_target ratio
+            def clip(x: int, low: int, high: int) -> int:
+                return max(low, min(x, high))
+            
+            def safe_ratio(
+                numerator: float,
+                denominator: float,
+                delta: float,
+                eps: float = 1e-8,
+            ) -> float:
+                # Both are essentially zero
+                if abs(denominator) < eps:
+                    if abs(numerator) < eps:
+                        ratio = 1.0
+                    else:
+                        ratio = float("inf")
+                else:
+                    ratio = numerator / denominator
 
-            return self.advantage, H_target
+                return clip(ratio, 1 - delta, 1 + delta)
+            
+            
+            h_target_ratio = safe_ratio(
+                success_rate,
+                self.teacher_acc,
+                self.small_delta,
+            )
+            debug(success_rate)
+            debug(self.teacher_acc)
+            debug(h_target_ratio)
+            
+            return self.advantage, H_target, h_target_ratio
 
     def __init__(self):
         self.nodes = {}
@@ -70,6 +114,13 @@ class TreeRewardManager:
             self.nodes[key] = TreeRewardManager.Node(input_ids, self)
 
         return self.nodes[key]
+    
+    def add_teacher_ids(self, input_ids, teacher_ids, teacher_acc):
+        node = self.add_node(input_ids=input_ids)
+        
+        for child in node.children:
+            child.teacher_ids = teacher_ids
+            child.teacher_acc = teacher_acc
 
     def add_child(self, parent_ids, child_ids):
         parent = self.add_node(parent_ids)
@@ -81,7 +132,8 @@ class TreeRewardManager:
         input_ids: torch.Tensor | None = None,
         node: Node | None = None,
         parent_node: Node | None = None,
-        batch:List | None = None
+        batch:List | None = None,
+        depth: int = 0
     ):
         if input_ids is not None:
             node = self.nodes[ids_key(input_ids)]
@@ -90,27 +142,30 @@ class TreeRewardManager:
 
         prev_len = 0 if parent_node is None else len(parent_node.input_ids)
 
-        debug("HI"*40)
-        debug(prev_len)
-        debug(input_ids)
-        debug(len(input_ids))
 
         for next_node in node.children:
             if next_node is node:
                 continue
-            self.traverse(node=next_node, parent_node=node, batch=batch)
-
-        correctness_advantage, H_target = node()
-
-        reward_mask = torch.zeros_like(input_ids, dtype=torch.long)
-        reward_mask[prev_len:] = 1
-
+            self.traverse(node=next_node, parent_node=node, batch=batch, depth=depth + 1)
+        
+        debug("IHI"*30)
+        debug(depth)
+        debug(input_ids)
+        
+        # If it is the prompt then do not push it to the batch
         if parent_node is not None:
+            correctness_advantage, H_target, ratio = node()
+
+            reward_mask = torch.zeros_like(input_ids, dtype=torch.long)
+            reward_mask[prev_len:] = 1
+            
             batch.append({
                 "correctness_advantage": correctness_advantage,
                 "H_target": H_target,
                 "reward_mask": reward_mask,
                 "input_ids": input_ids,
+                "h_target_ratio": ratio,
+                "teacher_prefix": node.teacher_ids
             })
 
     def __freeze_old_policy_logits__(self, mini_batch):

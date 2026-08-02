@@ -11,15 +11,19 @@ CHECKPOINT_DIR = "./checkpoints/tuned-llama-b3"
 BATCH_SIZE = 4
 CHECKPOINT_STEP = 100
 UPDATE_STEP = 3
+NUM_STEPS = None
 
 # Number of already completed batches.
 # For example, 500 means batches 0 through 499 were already completed.
-START_STEP = 1700
+START_STEP = 0
 
 
 def get_gsm8k_answer(ans):
     return ans.split("####")[-1].strip()
 
+
+def get_gsm8k_reference_answer(ans):
+    return ans.split("####")[0].strip()
 
 if __name__ == "__main__":
 
@@ -63,13 +67,16 @@ if __name__ == "__main__":
 
     controller = RLController(
         model_path=model_path,
-        rollout_gpus=[0],
-        trainer_gpus=[1, 2],
+        rollout_gpus=[0, 1],
+        trainer_gpus=[2, 3],
     )
 
     controller.init_nccl_sync()
 
-    num_steps = len(dataset) // BATCH_SIZE
+    if NUM_STEPS is None:
+        num_steps = len(dataset) // BATCH_SIZE
+    else:
+        num_steps = min(NUM_STEPS, len(dataset) // BATCH_SIZE)
 
     if START_STEP >= num_steps:
         raise ValueError(
@@ -92,6 +99,7 @@ if __name__ == "__main__":
 
         prompts = []
         gts = []
+        reference_answers = []
 
         for sample in batch:
             prompts.append(
@@ -115,10 +123,15 @@ if __name__ == "__main__":
             gts.append(
                 get_gsm8k_answer(sample["answer"])
             )
+            
+            reference_answers.append(
+                get_gsm8k_reference_answer(sample["answer"])
+            )
 
         stats = controller.step(
             prompts=prompts,
             ground_truths=gts,
+            reference_answers=reference_answers
         )
 
         batch_mean = stats["reward/mean"]

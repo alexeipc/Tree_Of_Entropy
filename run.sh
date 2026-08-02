@@ -41,6 +41,6 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 
 #CUDA_VISIBLE_DEVICES=0,1,2 python test_sync.py
-#python test_main_copy.py
+python test_main_copy.py
 #python sft_eval.py
-CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run  --master_port=29517 --nproc_per_node=3 raw_grpo.py
+#CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run  --master_port=29517 --nproc_per_node=3 raw_grpo.py

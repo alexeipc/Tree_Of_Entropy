@@ -11,6 +11,9 @@ BATCH_SIZE = 3
 def get_gsm8k_answer(ans):
     return ans.split("####")[-1].strip()
 
+def get_gsm8k_reference_answer(ans):
+    return ans.split("####")[0].strip()
+
 if __name__ == "__main__":
 
     dataset = load_dataset(
@@ -35,8 +38,10 @@ if __name__ == "__main__":
         trainer_gpus=[1, 2]
     )
 
-    num_steps = len(dataset) // BATCH_SIZE
+    # num_steps = len(dataset) // BATCH_SIZE
 
+    num_steps = 1
+    
     for step in range(num_steps):
 
         start = step * BATCH_SIZE
@@ -46,6 +51,7 @@ if __name__ == "__main__":
 
         prompts = []
         gts = []
+        reference_answers = []
 
         for sample in batch:
 
@@ -59,7 +65,7 @@ if __name__ == "__main__":
                     )
                 }
             ])
-
+            reference_answers.append(get_gsm8k_reference_answer(sample["final_answer"]))
             gts.append(get_gsm8k_answer(sample["final_answer"]))
 
         stats = controller.step(
