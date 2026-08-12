@@ -1,16 +1,21 @@
 from mathruler.grader import grade_answer
-import re
 from util.debug import debug
 
 
 def get_assistant_only(text: str) -> str:
     marker = "<|start_header_id|>assistant<|end_header_id|>"
+
     if marker in text:
         return text.split(marker, 1)[1]
+
     return text
 
 
 def extract_after_think(text: str):
+    """
+    Strictly require exactly one <think>...</think> block,
+    then return everything after </think>.
+    """
     text = get_assistant_only(text)
 
     if text.count("<think>") != 1 or text.count("</think>") != 1:
@@ -22,28 +27,76 @@ def extract_after_think(text: str):
     return text.split("</think>", 1)[1]
 
 
+def extract_last_boxed(text: str):
+    """
+    Extract the last \\boxed{...} expression while correctly
+    handling nested braces.
+
+    Examples:
+        \\boxed{42}
+        \\boxed{\\frac{1}{2}}
+        \\boxed{\\dfrac{\\pi}{48}}
+        \\boxed{\\sqrt{\\frac{3}{5}}}
+    """
+    marker = r"\boxed{"
+
+    starts = []
+    pos = 0
+
+    while True:
+        idx = text.find(marker, pos)
+
+        if idx == -1:
+            break
+
+        starts.append(idx)
+        pos = idx + len(marker)
+
+    if not starts:
+        return None
+
+    # Search from the last boxed expression backward.
+    for start in reversed(starts):
+        content_start = start + len(marker)
+
+        depth = 1
+
+        for i in range(content_start, len(text)):
+            char = text[i]
+
+            if char == "{":
+                depth += 1
+
+            elif char == "}":
+                depth -= 1
+
+                if depth == 0:
+                    return text[content_start:i].strip()
+
+    return None
+
+
 def extract_boxed_after_think(text: str):
     """
-    Strict format extractor:
-    only accepts boxed answer after </think>.
-    Used for format reward.
+    Strict format extractor.
+
+    Only accepts a boxed answer appearing AFTER </think>.
+    Used for format reward and final correctness reward.
     """
     after = extract_after_think(text)
+
     if after is None:
         return None
 
-    matches = re.findall(r"\\boxed\{([^{}]+)\}", after)
-    if not matches:
-        return None
-
-    return matches[-1].strip()
+    return extract_last_boxed(after)
 
 
 def extract_last_boxed_after_open_think(text: str):
     """
-    Correctness extractor:
-    accepts the last boxed answer anywhere after <think>,
-    even if it appears inside the thinking section.
+    Correctness/debug extractor.
+
+    Accepts the last boxed answer anywhere after <think>,
+    including inside the thinking section.
     """
     text = get_assistant_only(text)
 
@@ -52,11 +105,7 @@ def extract_last_boxed_after_open_think(text: str):
 
     after_open_think = text.split("<think>", 1)[1]
 
-    matches = re.findall(r"\\boxed\{([^{}]+)\}", after_open_think)
-    if not matches:
-        return None
-
-    return matches[-1].strip()
+    return extract_last_boxed(after_open_think)
 
 
 def has_correct_format(text: str) -> bool:
@@ -64,26 +113,32 @@ def has_correct_format(text: str) -> bool:
 
 
 def reward(response: str, ground_truth: str) -> float:
-    # For format reward: boxed must be after </think>
+    # Boxed answer must appear after </think>
     boxed_answer_after_think = extract_boxed_after_think(response)
 
-    # For correctness reward: boxed can be anywhere after <think>
+    # Last boxed answer anywhere after <think>
+    # Kept only for debugging / inspection.
     boxed_answer = extract_last_boxed_after_open_think(response)
 
-    format_reward = 0.5 if boxed_answer_after_think is not None else 0.0
-
-    correct_reward = (
-        0.2
-        if boxed_answer is not None and grade_answer(boxed_answer, ground_truth)
+    # Format reward
+    format_reward = (
+        0.5
+        if boxed_answer_after_think is not None
         else 0.0
     )
-    
+
+    # Final-answer correctness reward
     pre_correct_reward = (
         1.0
-        if boxed_answer_after_think is not None and grade_answer(boxed_answer_after_think, ground_truth)
+        if (
+            boxed_answer_after_think is not None
+            and grade_answer(
+                boxed_answer_after_think,
+                ground_truth
+            )
+        )
         else 0.0
     )
-
 
     score = format_reward + pre_correct_reward
 
@@ -92,9 +147,12 @@ def reward(response: str, ground_truth: str) -> float:
     debug("PRED:", boxed_answer)
     debug("FORMAT_PRED:", boxed_answer_after_think)
     debug("FORMAT:", format_reward)
-    debug("CORRECT:", correct_reward)
+    debug("CORRECT:", pre_correct_reward)
     debug("SCORE:", score)
-    debug("Assistant response:\n", get_assistant_only(response))
+    debug(
+        "Assistant response:\n",
+        get_assistant_only(response)
+    )
     debug("*" * 80)
 
     return score

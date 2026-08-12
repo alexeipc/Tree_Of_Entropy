@@ -25,7 +25,7 @@ class TreeRewardManager:
             self.advantage = None
             self.teacher_ids = None
             self.teacher_acc = None
-            self.small_delta = 0.2
+            self.small_delta = 0.3
             
             self.n_branches = 1
 
@@ -88,8 +88,8 @@ class TreeRewardManager:
             
             
             h_target_ratio = safe_ratio(
-                success_rate,
                 self.teacher_acc,
+                success_rate,
                 self.small_delta,
             )
             debug(success_rate)
@@ -101,6 +101,7 @@ class TreeRewardManager:
     def __init__(self):
         self.nodes = {}
         self.batch = []
+        self.teacher_rewards = []
 
         self.H_min = 0.5
         self.H_max = 3.0
@@ -117,6 +118,7 @@ class TreeRewardManager:
     
     def add_teacher_ids(self, input_ids, teacher_ids, teacher_acc):
         node = self.add_node(input_ids=input_ids)
+        self.teacher_rewards.append(float(teacher_acc))
         
         for child in node.children:
             child.teacher_ids = teacher_ids

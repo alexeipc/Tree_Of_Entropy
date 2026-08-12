@@ -1,5 +1,23 @@
 import re
-from typing import List
+from typing import List, Pattern, Tuple
+
+
+USER_PATTERNS: Tuple[Pattern[str], ...] = (
+    # Llama 3 chat template
+    re.compile(
+        r"(<\|start_header_id\|>user<\|end_header_id\|>\s*)"
+        r"(.*?)"
+        r"(\s*<\|eot_id\|>)",
+        flags=re.DOTALL,
+    ),
+    # Qwen 2/2.5/3 chat template
+    re.compile(
+        r"(<\|im_start\|>user\s*)"
+        r"(.*?)"
+        r"(\s*<\|im_end\|>)",
+        flags=re.DOTALL,
+    ),
+)
 
 
 def create_teacher_prompt(
@@ -24,24 +42,24 @@ def change_prompts(
             "messages and reference_answers must have the same length."
         )
 
-    user_pattern = re.compile(
-        r"(<\|start_header_id\|>user<\|end_header_id\|>\s*)"
-        r"(.*?)"
-        r"(\s*<\|eot_id\|>)",
-        flags=re.DOTALL,
-    )
-
     changed_messages = []
 
     for message, reference_answer in zip(messages, reference_answers):
-        match = user_pattern.search(message)
+        user_pattern = next(
+            (pattern for pattern in USER_PATTERNS if pattern.search(message)),
+            None,
+        )
 
-        if match is None:
+        if user_pattern is None:
             raise ValueError(
-                "Could not find a Llama user section in the message."
+                "Could not find a Llama or Qwen user section in the message."
             )
 
-        # Everything between the first user header and its <|eot_id|>
+        match = user_pattern.search(message)
+        # The successful search above guarantees a match for this immutable string.
+        assert match is not None
+
+        # Everything between the first user header and its template end token.
         question = match.group(2).strip()
 
         teacher_prompt = create_teacher_prompt(

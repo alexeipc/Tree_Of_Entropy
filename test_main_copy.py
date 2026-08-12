@@ -6,7 +6,7 @@ import os
 
 
 BASE_MODEL_PATH = "./sft/Llama-3.2-3B-Instruct_mot_sft_final"
-CHECKPOINT_DIR = "./checkpoints/tuned-llama-b3"
+CHECKPOINT_DIR = "./checkpoints/tuned-llama-toe_opsd-b3"
 
 BATCH_SIZE = 4
 CHECKPOINT_STEP = 100
@@ -180,7 +180,7 @@ if __name__ == "__main__":
             )
 
     controller.save_and_sync(
-        "./checkpoints/final-b3"
+        "./checkpoints/final-toe_opsd-b3"
     )
 
     wandb.finish()

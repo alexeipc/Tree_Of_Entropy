@@ -6,14 +6,29 @@ from trl import SFTConfig, SFTTrainer
 MAX_LEN = 2048
 
 class ResponseOnlyCollator:
-    def __init__(self, tokenizer, response_template="<|start_header_id|>assistant<|end_header_id|>\n\n"):
+    def __init__(self, tokenizer, response_template=None):
         self.tokenizer = tokenizer
+        if response_template is None:
+            response_template = self._get_response_template(tokenizer)
         self.response_ids = tokenizer(
             response_template,
             add_special_tokens=False,
         ).input_ids
 
         self.debug_printed = 0
+
+    @staticmethod
+    def _get_response_template(tokenizer):
+        messages = [{"role": "user", "content": "template probe"}]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        conversation = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        if not prompt.startswith(conversation) or prompt == conversation:
+            raise ValueError("Could not derive the assistant marker from the chat template.")
+        return prompt[len(conversation):]
 
     def __call__(self, examples):
         batch = self.tokenizer.pad(
@@ -77,26 +92,6 @@ class SFT:
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.tokenizer.chat_template = """{% for message in messages %}
-{% if message['role'] == 'system' %}
-<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-{{ message['content'] }}<|eot_id|>
-{% elif message['role'] == 'user' %}
-<|start_header_id|>user<|end_header_id|>
-
-{{ message['content'] }}<|eot_id|>
-{% elif message['role'] == 'assistant' %}
-<|start_header_id|>assistant<|end_header_id|>
-
-{{ message['content'] }}<|eot_id|>
-{% endif %}
-{% endfor %}
-{% if add_generation_prompt %}
-<|start_header_id|>assistant<|end_header_id|>
-
-{% endif %}"""
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
@@ -164,7 +159,6 @@ class SFT:
 
         collator = ResponseOnlyCollator(
             tokenizer=self.tokenizer,
-            response_template="<|start_header_id|>assistant<|end_header_id|>\n\n",
         )
 
         trainer = SFTTrainer(

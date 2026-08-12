@@ -111,8 +111,7 @@ if __name__ == "__main__":
         learning_rate=1e-6,
         bf16=True,
 
-        # 3 trainer GPUs
-
+        # 4 trainer GPUs
         # 2 sequences/GPU × 3 GPUs = 6 completions per microstep
         per_device_train_batch_size=2,
 
@@ -125,7 +124,7 @@ if __name__ == "__main__":
 
         # 3 prompts × 4 completions = 12 generated at a time
         # Divisible by global microbatch 6
-        generation_batch_size=12,
+        generation_batch_size=16,
 
         max_completion_length=512,
 

@@ -231,9 +231,10 @@ class OPSD:
     def handle_batch(vllm: LLM,
                      teacher_messages: List[str],
                      teacher_reference_answers: List[str],
-                     teacher_n_branches: int,
+                     teacher_n_generations: int,
                      teacher_gts: List[str],
                      manager: TreeRewardManager,
+                     max_tokens: int,
                      input_ids):
         # Generate teacher's answers
         debug("*"*40,"Start Teacher message", "*"*40)
@@ -252,8 +253,8 @@ class OPSD:
                 temperature=0.6,
                 top_p=0.95,
                 #TODO: Calculate max_tokens
-                max_tokens=512,
-                n = teacher_n_branches,
+                max_tokens=max_tokens,
+                n=teacher_n_generations,
                 detokenize=True,
                 prompt_logprobs=0,
             )
@@ -287,6 +288,24 @@ class OPSD:
             correct_count = 0
 
             for completion in request_output.outputs:
+                print("=" * 80)
+                print("TEACHER FINISH REASON:", completion.finish_reason)
+                print("TEACHER STOP REASON:", completion.stop_reason)
+                print("TEACHER GENERATED TOKENS:", len(completion.token_ids))
+                print("TEACHER TEXT:")
+                
+                print("PROMPT TOKENS:", len(request_output.prompt_token_ids))
+                print("GENERATED TOKENS:", len(completion.token_ids))
+                print(
+                    "TOTAL TOKENS:",
+                    len(request_output.prompt_token_ids) + len(completion.token_ids)
+                )
+                print("FINISH:", completion.finish_reason)
+                print("STOP:", completion.stop_reason)
+                print("LAST TOKEN ID:", completion.token_ids[-1] if completion.token_ids else None)
+                
+                print("=" * 80)
+                
                 full_answer = prompts[i] + completion.text
 
                 reward_score = reward(

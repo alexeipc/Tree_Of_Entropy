@@ -52,9 +52,9 @@ python gsm8k_eval.py --model="./trl_grpo_gsm8k_600_final"\
      --output-json="outputs/trl_grpo_600/summary.json"
 COMMENT
 
-python gsm8k_eval.py --model="./trl_grpo_gsm8k_final"\
-     --output-dir="outputs/trl_dapo_gsm8k-b3_3"\
-     --output-json="outputs/trl_dapo_gsm8k-b3_3/summary.json"
+python gsm8k_eval.py --model="./checkpoints/final-toe_opsd-b3"\
+     --output-dir="outputs/opsd-toe-b3"\
+     --output-json="outputs/opsd-toe-b3/summary.json"
 
 
 

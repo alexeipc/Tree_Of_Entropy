@@ -171,7 +171,7 @@ def merge_outputs(output_dir: str, output_json: str, model: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--num-workers", type=int, default=3)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-cpus", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-tokens", type=int, default=1024)

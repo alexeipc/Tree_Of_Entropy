@@ -33,6 +33,24 @@ from util.debug import debug
 from opsd.opsd import OPSD
 
 
+def get_decoder_layer_cls(model):
+    """Return the transformer block class for supported causal LMs."""
+    model_type = getattr(model.config, "model_type", None)
+
+    if model_type == "llama":
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        return LlamaDecoderLayer
+
+    # Qwen2.5 checkpoints also use the qwen2 Transformers architecture.
+    if model_type == "qwen2":
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        return Qwen2DecoderLayer
+
+    raise ValueError(
+        f"Unsupported model architecture {model_type!r}. "
+        "Add its decoder layer class to get_decoder_layer_cls()."
+    )
+
 
 import wandb
 
@@ -51,13 +69,7 @@ except ConnectionError as e:
     ray.init()
 '''
 
-ray.init(
-    address=None,
-    _temp_dir=os.environ["RAY_TMPDIR"],
-    include_dashboard=False,
-    num_cpus=8,
-    num_gpus=4,
-)
+
 
 @ray.remote(num_gpus=2)
 class RolloutActor(AbstractRolloutWeightSync):
@@ -150,8 +162,37 @@ class RolloutActor(AbstractRolloutWeightSync):
             [item["reward"] for group in groups.values() for item in group],
             dtype=torch.float32,
         ).mean().item()
+
+        mean_teacher_reward = (
+            sum(tree_reward_manager.teacher_rewards)
+            / len(tree_reward_manager.teacher_rewards)
+            if tree_reward_manager.teacher_rewards
+            else 0.0
+        )
+
+        rollout_items = [
+            item
+            for group in groups.values()
+            for item in group
+        ]
+        total_response_length = sum(
+            item["response_length"]
+            for item in rollout_items
+        )
+        avg_rollouts_per_prompt = (
+            len(rollout_items) / len(input_ids)
+            if input_ids
+            else 0.0
+        )
         
-        return tree_reward_manager, input_ids, mean_reward
+        return (
+            tree_reward_manager,
+            input_ids,
+            mean_reward,
+            mean_teacher_reward,
+            total_response_length,
+            avg_rollouts_per_prompt,
+        )
     
     def get_vllm_engine(self):
         return self.llm
@@ -219,12 +260,13 @@ class FSDPTrainerActor(AbstractFSDPWeightSync):
         ).cuda()
 
         model.config.use_cache = False
+        model.config.pad_token_id = self.tokenizer.pad_token_id
 
-        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        decoder_layer_cls = get_decoder_layer_cls(model)
 
         wrap_policy = partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={LlamaDecoderLayer},
+            transformer_layer_cls={decoder_layer_cls},
         )
 
         self.model = FSDP(
@@ -253,7 +295,7 @@ class FSDPTrainerActor(AbstractFSDPWeightSync):
                 checkpoint_wrapper,
                 checkpoint_impl=CheckpointImpl.NO_REENTRANT,
             ),
-            check_fn=lambda module: isinstance(module, LlamaDecoderLayer),
+            check_fn=lambda module: isinstance(module, decoder_layer_cls),
         )
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6)
@@ -612,14 +654,35 @@ class RLController(AbstractWeightSyncController):
         return losses
 
     def step(self, prompts, ground_truths, reference_answers):
-        manager, input_ids, mean_reward = self.rollout_samples(prompts, ground_truths, reference_answers)
+        rollout_start = time.perf_counter()
+        (
+            manager,
+            input_ids,
+            mean_reward,
+            mean_teacher_reward,
+            total_response_length,
+            avg_rollouts_per_prompt,
+        ) = self.rollout_samples(
+            prompts,
+            ground_truths,
+            reference_answers,
+        )
+        rollout_seconds = time.perf_counter() - rollout_start
+
+        optimizer_start = time.perf_counter()
         losses = self.train_on_samples(manager=manager, input_ids=input_ids)
+        optimizer_seconds = time.perf_counter() - optimizer_start
         
         return {
             "losses": losses,
             "num_samples": len(input_ids),
             "avg_loss": sum(losses) / len(losses),
-            "reward/mean": mean_reward
+            "reward/mean": mean_reward,
+            "teacher_reward/mean": mean_teacher_reward,
+            "rollout/total_response_length": total_response_length,
+            "rollout/avg_rollouts_per_prompt": avg_rollouts_per_prompt,
+            "time/rollout_seconds": rollout_seconds,
+            "time/optimizer_seconds": optimizer_seconds,
         }
     
     @property
