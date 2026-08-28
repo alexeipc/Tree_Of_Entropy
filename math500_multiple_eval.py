@@ -89,9 +89,11 @@ class VLLMMath500Worker:
         temperature: float,
         top_p: float,
         gpu_memory_utilization: float,
+        num_runs: int,
     ):
         self.rank = rank
         self.batch_size = batch_size
+        self.num_runs = num_runs
 
         from vllm import LLM, SamplingParams
 
@@ -99,6 +101,7 @@ class VLLMMath500Worker:
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
+            n=1,
         )
 
         self.llm = LLM(
@@ -117,87 +120,141 @@ class VLLMMath500Worker:
     def run(
         self,
         shard: List[Dict[str, Any]],
-        output_path: str,
+        output_path: Optional[str] = None,
+        save_output: bool = False,
     ):
         correct = 0
         total = 0
+        run_stats = {
+            run_id: {"correct": 0, "total": 0}
+            for run_id in range(self.num_runs)
+        }
 
-        with open(output_path, "w") as f:
-            for start in range(0, len(shard), self.batch_size):
-                batch = shard[start : start + self.batch_size]
+        f = open(output_path, "w") if save_output and output_path else None
+        try:
+            # Run the entire shard once per benchmark run. Each vLLM request
+            # returns exactly one generation, so a run is one independently
+            # sampled answer for every MATH-500 problem.
+            for run_id in range(self.num_runs):
+                run_correct = 0
+                run_total = 0
 
-                prompts = [
-                    self.tokenizer.apply_chat_template(
-                        make_messages(x["problem"]),
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for x in batch
-                ]
+                for start in range(0, len(shard), self.batch_size):
+                    batch = shard[start : start + self.batch_size]
 
-                gts = [x["ground_truth"] for x in batch]
-
-                outputs = self.llm.generate(
-                    prompts,
-                    self.sampling_params,
-                )
-
-                for sample, out, gt in zip(batch, outputs, gts):
-                    response = out.outputs[0].text
-                    pred = extract_answer(response)
-
-                    ok = (
-                        pred is not None
-                        and grade_answer(pred, gt)
-                    )
-
-                    row = {
-                        "idx": sample["idx"],
-                        "rank": self.rank,
-                        "problem": sample["problem"],
-                        "ground_truth": gt,
-                        "prediction": pred,
-                        "correct": bool(ok),
-                        "response": response,
-                    }
-
-                    # Include optional MATH metadata when available.
-                    if "subject" in sample:
-                        row["subject"] = sample["subject"]
-
-                    if "level" in sample:
-                        row["level"] = sample["level"]
-
-                    if "solution" in sample:
-                        row["reference_solution"] = sample["solution"]
-
-                    f.write(
-                        json.dumps(
-                            row,
-                            ensure_ascii=False,
+                    prompts = [
+                        self.tokenizer.apply_chat_template(
+                            make_messages(x["problem"]),
+                            tokenize=False,
+                            add_generation_prompt=True,
                         )
-                        + "\n"
-                    )
-                    f.flush()
+                        for x in batch
+                    ]
 
-                    correct += int(ok)
-                    total += 1
+                    gts = [x["ground_truth"] for x in batch]
+
+                    outputs = self.llm.generate(
+                        prompts,
+                        self.sampling_params,
+                    )
+
+                    for sample, out, gt in zip(batch, outputs, gts):
+                        candidate = out.outputs[0]
+                        response = candidate.text
+                        pred = extract_answer(response)
+
+                        ok = (
+                            pred is not None
+                            and grade_answer(pred, gt)
+                        )
+
+                        row = {
+                            "idx": sample["idx"],
+                            "run_id": run_id,
+                            "rank": self.rank,
+                            "problem": sample["problem"],
+                            "ground_truth": gt,
+                            "prediction": pred,
+                            "correct": bool(ok),
+                            "response": response,
+                        }
+
+                        # Include optional MATH metadata when available.
+                        if "subject" in sample:
+                            row["subject"] = sample["subject"]
+
+                        if "level" in sample:
+                            row["level"] = sample["level"]
+
+                        if "solution" in sample:
+                            row["reference_solution"] = sample["solution"]
+
+                        if f is not None:
+                            f.write(
+                                json.dumps(
+                                    row,
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+
+                        correct += int(ok)
+                        total += 1
+                        run_correct += int(ok)
+                        run_total += 1
+                        run_stats[run_id]["correct"] += int(ok)
+                        run_stats[run_id]["total"] += 1
 
                 print(
                     f"[rank {self.rank}] "
-                    f"{total}/{len(shard)} "
-                    f"acc={correct / max(total, 1):.4f}",
+                    f"run {run_id + 1}/{self.num_runs}: "
+                    f"{run_correct}/{run_total} "
+                    f"acc={run_correct / max(run_total, 1):.4f}",
                     flush=True,
                 )
+        finally:
+            if f is not None:
+                f.close()
 
         return {
             "rank": self.rank,
-            "output_path": output_path,
+            "output_path": output_path if save_output else None,
             "total": total,
             "correct": correct,
             "accuracy": correct / max(total, 1),
+            "run_stats": run_stats,
         }
 
+
+
+def aggregate_worker_stats(stats, num_runs: int):
+    run_stats = {
+        run_id: {"correct": 0, "total": 0}
+        for run_id in range(num_runs)
+    }
+    total = 0
+    correct = 0
+    for worker_stats in stats:
+        total += worker_stats["total"]
+        correct += worker_stats["correct"]
+        for run_id_raw, s in worker_stats["run_stats"].items():
+            run_id = int(run_id_raw)
+            run_stats[run_id]["correct"] += s["correct"]
+            run_stats[run_id]["total"] += s["total"]
+    run_accuracies = []
+    for run_id in range(num_runs):
+        s = run_stats[run_id]
+        s["accuracy"] = s["correct"] / max(s["total"], 1)
+        run_accuracies.append(s["accuracy"])
+    average_accuracy = sum(run_accuracies) / len(run_accuracies) if run_accuracies else 0.0
+    return {
+        "num_runs": num_runs,
+        "samples_total": total,
+        "correct_total": correct,
+        "average_accuracy": average_accuracy,
+        "run_accuracies": run_accuracies,
+        "run_stats": run_stats,
+    }
 
 def merge_outputs(
     output_dir: str,
@@ -214,21 +271,40 @@ def merge_outputs(
             for line in f:
                 rows.append(json.loads(line))
 
-    rows.sort(key=lambda x: x["idx"])
+    rows.sort(key=lambda x: (x.get("run_id", 0), x["idx"]))
 
-    correct = sum(
-        int(x["correct"])
-        for x in rows
-    )
-
+    correct = sum(int(x["correct"]) for x in rows)
     total = len(rows)
+
+    # Accuracy for each independent run (one sampled answer per MATH500 problem).
+    run_stats = {}
+    for row in rows:
+        run_id = row.get("run_id", 0)
+        if run_id not in run_stats:
+            run_stats[run_id] = {"correct": 0, "total": 0}
+        run_stats[run_id]["correct"] += int(row["correct"])
+        run_stats[run_id]["total"] += 1
+
+    run_accuracies = []
+    for run_id in sorted(run_stats):
+        stats = run_stats[run_id]
+        stats["accuracy"] = stats["correct"] / max(stats["total"], 1)
+        run_accuracies.append(stats["accuracy"])
+
+    average_accuracy = (
+        sum(run_accuracies) / len(run_accuracies)
+        if run_accuracies else 0.0
+    )
 
     final = {
         "model": model,
         "dataset": "HuggingFaceH4/MATH-500",
-        "total": total,
-        "correct": correct,
-        "accuracy": correct / max(total, 1),
+        "num_runs": len(run_accuracies),
+        "samples_total": total,
+        "correct_total": correct,
+        "average_accuracy": average_accuracy,
+        "run_accuracies": run_accuracies,
+        "run_stats": run_stats,
         "results": rows,
     }
 
@@ -316,6 +392,13 @@ def main():
     )
 
     parser.add_argument(
+        "--num-runs",
+        type=int,
+        default=64,
+        help="Independent sampled generations per problem.",
+    )
+
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -329,6 +412,12 @@ def main():
     parser.add_argument(
         "--output-json",
         default="math500_ray_results.json",
+    )
+
+    parser.add_argument(
+        "--save-output",
+        action="store_true",
+        help="Save JSONL/JSON outputs. Default: print results only.",
     )
 
     parser.add_argument(
@@ -351,10 +440,11 @@ def main():
         "RAY_DEDUP_LOGS"
     ] = "0"
 
-    os.makedirs(
-        args.output_dir,
-        exist_ok=True,
-    )
+    if args.save_output:
+        os.makedirs(
+            args.output_dir,
+            exist_ok=True,
+        )
 
     # MATH-500 contains exactly 500 evaluation problems.
     ds = load_dataset(
@@ -427,6 +517,7 @@ def main():
             gpu_memory_utilization=(
                 args.gpu_memory_utilization
             ),
+            num_runs=args.num_runs,
         )
         for i in range(args.num_workers)
     ]
@@ -447,7 +538,8 @@ def main():
         futures.append(
             worker.run.remote(
                 shards[i],
-                output_path,
+                output_path if args.save_output else None,
+                args.save_output,
             )
         )
 
@@ -459,37 +551,34 @@ def main():
     for s in stats:
         print(s)
 
-    final = merge_outputs(
-        args.output_dir,
-        args.output_json,
-        args.model,
-    )
+    final = aggregate_worker_stats(stats, args.num_runs)
 
     print("=" * 80)
-
     print(
-        f"FINAL accuracy: "
-        f"{final['correct']}/{final['total']} "
-        f"= {final['accuracy']:.4f}"
+        f"FINAL average accuracy over {final['num_runs']} independent runs: "
+        f"{final['average_accuracy']:.4f}"
+    )
+    print(
+        f"Total sampled answers: {final['samples_total']} "
+        f"({len(ds)} problems x {args.num_runs} runs)"
     )
 
-    if final["subjects"]:
-        print("\nPer-subject accuracy:")
+    for run_id, acc in enumerate(final["run_accuracies"]):
+        rs = final["run_stats"][run_id]
+        print(
+            f"run {run_id:02d}: "
+            f"{rs['correct']}/{rs['total']} = {acc:.4f}"
+        )
 
-        for subject, stats in sorted(
-            final["subjects"].items()
-        ):
-            print(
-                f"{subject:25s}: "
-                f"{stats['correct']:3d}/"
-                f"{stats['total']:3d} "
-                f"= {stats['accuracy']:.4f}"
-            )
-
-    print(
-        f"\nSaved JSON to: "
-        f"{args.output_json}"
-    )
+    if args.save_output:
+        merge_outputs(
+            args.output_dir,
+            args.output_json,
+            args.model,
+        )
+        print(f"\nSaved JSON to: {args.output_json}")
+    else:
+        print("\nOutput saving disabled (use --save-output to enable).")
 
     ray.shutdown()
 

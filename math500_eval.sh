@@ -45,11 +45,11 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
 # mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HF_HUB_CACHE"
 
-python math500_eval.py \
-    --model meta-llama/Llama-3.1-8B-Instruct \
+python math500_multiple_eval.py \
+    --model "/scratch/pioneer/users/ptd18/models/checkpoints/tuned-qwen-toe-opsd-deepmath-no-sft/checkpoint-7000" \
     --num-workers 4 \
-    --batch-size 32 \
-    --max-tokens 2048 \
-    --temperature 0 \
-    --output-dir math500_ray_outputs-8B \
-    --output-json math500_ray_results-8B.json
+    --batch-size 128 \
+    --num-runs 10 \
+    --max-tokens 3500 \
+    --output-dir outputs/math500_toe-qwen_multiple-outputs-2 \
+    --output-json outputs/math500_toe-qwen_multiple-results-2.json

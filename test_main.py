@@ -34,8 +34,9 @@ if __name__ == "__main__":
 
     controller = RLController(
         model_path=MODEL_PATH,
-        rollout_gpus=[0],
-        trainer_gpus=[1, 2]
+        base_model_path=MODEL_PATH,
+        rollout_gpus=[0, 1, 2],
+        trainer_gpus=[3]
     )
 
     # num_steps = len(dataset) // BATCH_SIZE
@@ -77,6 +78,9 @@ if __name__ == "__main__":
             "step": step,
             "avg_loss": stats["avg_loss"],
             "num_samples": stats["num_samples"],
+            "rollout/avg_response_entropy": stats[
+                "rollout/avg_response_entropy"
+            ],
         })
 
         print(

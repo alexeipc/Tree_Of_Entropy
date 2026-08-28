@@ -3,10 +3,25 @@ from util.debug import debug
 
 
 def get_assistant_only(text: str) -> str:
-    marker = "<|start_header_id|>assistant<|end_header_id|>"
+    """Return the content following a Llama or Qwen assistant header."""
+    assistant_markers = (
+        "<|start_header_id|>assistant<|end_header_id|>",  # Llama Instruct
+        "<|im_start|>assistant\r\n",                       # Qwen Instruct
+        "<|im_start|>assistant\n",
+        "<|im_start|>assistant",
+    )
 
-    if marker in text:
-        return text.split(marker, 1)[1]
+    # Use the first assistant header in the rendered conversation. Checking
+    # markers by position (rather than tuple order) keeps this correct even if
+    # a mixed-format string is supplied.
+    matches = [
+        (text.find(marker), marker)
+        for marker in assistant_markers
+        if marker in text
+    ]
+    if matches:
+        marker_index, marker = min(matches, key=lambda match: match[0])
+        return text[marker_index + len(marker):]
 
     return text
 

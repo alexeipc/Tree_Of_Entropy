@@ -1,5 +1,5 @@
 from multiprocessing import shared_memory
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -33,8 +33,9 @@ class Tree:
         llm: LLM,
         eos_id: int,
         tree_reward_manager: TreeRewardManager,
-        branching_threshold: float = 0.3,
+        branching_threshold: float = 0.15,
         batch_size: int = 64,
+        teacher_submitter: Optional[Callable] = None,
     ):
         self.llm = llm
         self.eos_id = int(eos_id)
@@ -44,13 +45,14 @@ class Tree:
         self.branching_threshold = branching_threshold
 
         self.manager = tree_reward_manager
+        self.teacher_submitter = teacher_submitter
 
         # Maximum number of requests passed to one primary vLLM call.
         # Increase this if your KV cache can hold more requests.
         self.batch_size = batch_size
 
         # Maximum number of tokens generated after the original input.
-        self.max_generated_length = 2048
+        self.max_generated_length = 3500
 
     # ------------------------------------------------------------------
     # Reward normalization
@@ -59,6 +61,7 @@ class Tree:
     @staticmethod
     def normalize_group(groups: dict[Any, list[dict[str, Any]]]) -> None:
         debug("*#" * 80)
+        debug("NORMALIZING REWARDS FOR EACH GROUP")
 
         for group in groups.values():
             if not group:
@@ -95,18 +98,28 @@ class Tree:
             "input_ids": [],
         }
 
-    @staticmethod
     def _add_to_teacher_queue(
+        self,
         teacher_queue: dict[str, list[Any]],
         message: str,
         reference_answer: str,
         gt: str,
         input_ids: torch.Tensor,
     ) -> None:
+        if self.teacher_submitter is not None:
+            self.teacher_submitter(
+                message,
+                reference_answer,
+                gt,
+                input_ids,
+            )
+            return
+
         teacher_queue["messages"].append(message)
         teacher_queue["reference_answers"].append(reference_answer)
         teacher_queue["gts"].append(gt)
         teacher_queue["input_ids"].append(input_ids)
+
 
     def _flush_teacher_queue(
         self,
@@ -886,9 +899,11 @@ class Tree:
             f"{len(teacher_queue['messages'])}"
         )
 
-        # Generate every teacher request only after the whole student tree
-        # has been constructed.
-        self._flush_teacher_queue(teacher_queue)
+        # A separate frozen base-model actor can consume this queue. Keeping
+        # it out of the policy rollout actor prevents teacher generations
+        # from silently evolving with the student policy.
+        if self.teacher_submitter is None:
+            self._flush_teacher_queue(teacher_queue)
 
         if is_init:
             Tree.normalize_group(groups)

@@ -67,8 +67,9 @@ if __name__ == "__main__":
 
     controller = RLController(
         model_path=model_path,
-        rollout_gpus=[0, 1],
-        trainer_gpus=[2, 3],
+        base_model_path=model_path,
+        rollout_gpus=[0, 1, 2],
+        trainer_gpus=[3],
     )
 
     controller.init_nccl_sync()
@@ -160,6 +161,9 @@ if __name__ == "__main__":
                 "reward/mean": batch_mean,
                 "reward/cummean": reward_cummean,
                 "reward/ema": reward_ema,
+                "rollout/avg_response_entropy": stats[
+                    "rollout/avg_response_entropy"
+                ],
             },
             step=current_step,
         )

@@ -11,17 +11,17 @@ import ray
 
 
 # Change this to your actual 8B checkpoint.
-BASE_MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
-CHECKPOINT_DIR = "/scratch/pioneer/users/ptd18/models/checkpoints/tuned-llama-8b-toe-opsd-deepmath-no-sft"
+BASE_MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
+CHECKPOINT_DIR = "/scratch/pioneer/users/ptd18/models/checkpoints/tuned-qwen-toe-opsd-deepmath-no-sft-1024-max-length"
 
 BATCH_SIZE = 6
-CHECKPOINT_STEP = 100
+CHECKPOINT_STEP = 500
 UPDATE_STEP = 3
 NUM_STEPS = None
 
 # Number of already completed batches.
 # For example, 500 means batches 0 through 499 were already completed.
-START_STEP = 300
+START_STEP = 0
 
 # Dataset configuration.
 DATASET_NAME = "zwhe99/DeepMath-103K"
@@ -199,7 +199,7 @@ if __name__ == "__main__":
         print(f"Starting from base model: {model_path}")
 
     wandb.init(
-        project="tree-of-entropy-llama-8b",
+        project="tree-of-entropy-qwen",
         name="no-sft-deepmath",
         config={
             "dataset": DATASET_NAME,
@@ -215,6 +215,7 @@ if __name__ == "__main__":
             "update_step": UPDATE_STEP,
             "start_step": START_STEP,
             "model_path": model_path,
+            "base_model_path": BASE_MODEL_PATH,
         },
     )
     
@@ -223,13 +224,15 @@ if __name__ == "__main__":
         _temp_dir=os.environ["RAY_TMPDIR"],
         include_dashboard=False,
         num_cpus=8,
-        num_gpus=4,
+        # 2 rollout + 2 teacher + 2 entropy + 2 FSDP ranks.
+        num_gpus=8,
     )
 
     controller = RLController(
         model_path=model_path,
-        rollout_gpus=[0, 1],
-        trainer_gpus=[2, 3],
+        base_model_path=BASE_MODEL_PATH,
+        rollout_gpus=[0, 1, 2, 3, 4, 5],
+        trainer_gpus=[6,7],
     )
 
     controller.init_nccl_sync()
@@ -364,6 +367,9 @@ if __name__ == "__main__":
                 "rollout/avg_rollouts_per_prompt": stats[
                     "rollout/avg_rollouts_per_prompt"
                 ],
+                "rollout/avg_response_entropy": stats[
+                    "rollout/avg_response_entropy"
+                ],
                 "time/rollout_seconds": stats[
                     "time/rollout_seconds"
                 ],
@@ -395,7 +401,7 @@ if __name__ == "__main__":
             )
 
     controller.save_and_sync(
-        "./checkpoints/final-llama-8b-toe-opsd-deepmath"
+        "./checkpoints/final-qwen-toe-opsd-deepmath"
     )
 
     wandb.finish()

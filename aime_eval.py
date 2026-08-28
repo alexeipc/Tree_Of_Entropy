@@ -10,10 +10,6 @@ from transformers import AutoTokenizer
 from mathruler.grader import grade_answer
 
 
-import re
-from typing import Optional
-
-
 def extract_last_boxed(text: str) -> Optional[str]:
     marker = r"\boxed{"
     start = text.rfind(marker)
@@ -36,7 +32,6 @@ def extract_last_boxed(text: str) -> Optional[str]:
 
         i += 1
 
-    # Unclosed \boxed{
     return None
 
 
@@ -78,8 +73,100 @@ def make_messages(question: str):
     ]
 
 
+def normalize_answer(answer: Any) -> str:
+    """
+    AIME answers are integers from 000 to 999.
+
+    Keep them as strings for grading. If a dataset stores an integer,
+    convert it to the ordinary decimal representation. mathruler handles
+    numerical equivalence, so e.g. 4 and 004 are equivalent as numbers.
+    """
+    if answer is None:
+        return ""
+
+    if isinstance(answer, bool):
+        return str(int(answer))
+
+    if isinstance(answer, int):
+        return str(answer)
+
+    if isinstance(answer, float) and answer.is_integer():
+        return str(int(answer))
+
+    return str(answer).strip()
+
+
+def load_aime_rows(years: List[int]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    # AIME 2023 and 2024:
+    # AI-MO/aimo-validation-aime contains AIME 2022-2024.
+    old_years = [y for y in years if y in (2023, 2024)]
+
+    if old_years:
+        ds = load_dataset(
+            "AI-MO/aimo-validation-aime",
+            split="train",
+        )
+
+        for x in ds:
+            year = int(x["year"])
+            if year not in old_years:
+                continue
+
+            rows.append(
+                {
+                    "year": year,
+                    "exam": f"AIME {year}",
+                    "problem": x["problem"],
+                    "ground_truth": normalize_answer(x["answer"]),
+                    "reference_solution": x.get("solution"),
+                    "url": x.get("url"),
+                }
+            )
+
+    # AIME 2025:
+    # opencompass/AIME2025 has two configs, 15 questions each.
+    if 2025 in years:
+        for config_name in ("AIME2025-I", "AIME2025-II"):
+            ds = load_dataset(
+                "opencompass/AIME2025",
+                config_name,
+                split="test",
+            )
+
+            for x in ds:
+                # Current dataset schema uses "question" and "answer".
+                # Accept "problem" too in case the dataset schema changes.
+                problem = x.get("question", x.get("problem"))
+                answer = x.get("answer")
+
+                if problem is None:
+                    raise KeyError(
+                        f"Could not find question/problem field in "
+                        f"opencompass/AIME2025 {config_name}. "
+                        f"Available keys: {list(x.keys())}"
+                    )
+
+                rows.append(
+                    {
+                        "year": 2025,
+                        "exam": config_name.replace("AIME2025", "AIME 2025"),
+                        "problem": problem,
+                        "ground_truth": normalize_answer(answer),
+                    }
+                )
+
+    # Give every sample a stable global index after combining datasets.
+    rows.sort(key=lambda x: (x["year"], x["exam"]))
+    for i, row in enumerate(rows):
+        row["idx"] = i
+
+    return rows
+
+
 @ray.remote(num_gpus=1)
-class VLLMMath500Worker:
+class VLLMAIMEWorker:
     def __init__(
         self,
         rank: int,
@@ -154,6 +241,8 @@ class VLLMMath500Worker:
                     row = {
                         "idx": sample["idx"],
                         "rank": self.rank,
+                        "year": sample["year"],
+                        "exam": sample["exam"],
                         "problem": sample["problem"],
                         "ground_truth": gt,
                         "prediction": pred,
@@ -161,15 +250,11 @@ class VLLMMath500Worker:
                         "response": response,
                     }
 
-                    # Include optional MATH metadata when available.
-                    if "subject" in sample:
-                        row["subject"] = sample["subject"]
+                    if sample.get("reference_solution") is not None:
+                        row["reference_solution"] = sample["reference_solution"]
 
-                    if "level" in sample:
-                        row["level"] = sample["level"]
-
-                    if "solution" in sample:
-                        row["reference_solution"] = sample["solution"]
+                    if sample.get("url") is not None:
+                        row["url"] = sample["url"]
 
                     f.write(
                         json.dumps(
@@ -203,6 +288,7 @@ def merge_outputs(
     output_dir: str,
     output_json: str,
     model: str,
+    years: List[int],
 ):
     rows = []
 
@@ -216,49 +302,58 @@ def merge_outputs(
 
     rows.sort(key=lambda x: x["idx"])
 
-    correct = sum(
-        int(x["correct"])
-        for x in rows
-    )
-
+    correct = sum(int(x["correct"]) for x in rows)
     total = len(rows)
 
     final = {
         "model": model,
-        "dataset": "HuggingFaceH4/MATH-500",
+        "dataset": "AIME 2023/2024/2025",
+        "years": years,
         "total": total,
         "correct": correct,
         "accuracy": correct / max(total, 1),
         "results": rows,
     }
 
-    # Optional per-subject stats.
-    subjects = {}
+    per_year = {}
+    per_exam = {}
 
     for row in rows:
-        subject = row.get("subject")
+        year = str(row["year"])
+        exam = row["exam"]
 
-        if subject is None:
-            continue
-
-        if subject not in subjects:
-            subjects[subject] = {
+        if year not in per_year:
+            per_year[year] = {
                 "correct": 0,
                 "total": 0,
             }
 
-        subjects[subject]["total"] += 1
-        subjects[subject]["correct"] += int(
-            row["correct"]
-        )
+        per_year[year]["total"] += 1
+        per_year[year]["correct"] += int(row["correct"])
 
-    for subject, stats in subjects.items():
+        if exam not in per_exam:
+            per_exam[exam] = {
+                "correct": 0,
+                "total": 0,
+            }
+
+        per_exam[exam]["total"] += 1
+        per_exam[exam]["correct"] += int(row["correct"])
+
+    for stats in per_year.values():
         stats["accuracy"] = (
             stats["correct"]
             / max(stats["total"], 1)
         )
 
-    final["subjects"] = subjects
+    for stats in per_exam.values():
+        stats["accuracy"] = (
+            stats["correct"]
+            / max(stats["total"], 1)
+        )
+
+    final["per_year"] = per_year
+    final["per_exam"] = per_exam
 
     with open(output_json, "w") as f:
         json.dump(
@@ -277,6 +372,15 @@ def main():
     parser.add_argument(
         "--model",
         required=True,
+    )
+
+    parser.add_argument(
+        "--years",
+        type=int,
+        nargs="+",
+        default=[2023, 2024, 2025],
+        choices=[2023, 2024, 2025],
+        help="AIME years to evaluate. Default: 2023 2024 2025",
     )
 
     parser.add_argument(
@@ -306,29 +410,30 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.6,
+        default=0.0,
     )
 
     parser.add_argument(
         "--top-p",
         type=float,
-        default=0.95,
+        default=1.0,
     )
 
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
+        help="Optional limit AFTER combining the selected AIME years.",
     )
 
     parser.add_argument(
         "--output-dir",
-        default="math500_ray_outputs",
+        default="aime_23_24_25_ray_outputs",
     )
 
     parser.add_argument(
         "--output-json",
-        default="math500_ray_results.json",
+        default="aime_23_24_25_ray_results.json",
     )
 
     parser.add_argument(
@@ -339,70 +444,52 @@ def main():
 
     args = parser.parse_args()
 
-    os.environ[
-        "VLLM_WORKER_MULTIPROC_METHOD"
-    ] = "spawn"
+    # Remove duplicate years while preserving command-line order.
+    args.years = list(dict.fromkeys(args.years))
 
-    os.environ[
-        "TOKENIZERS_PARALLELISM"
-    ] = "false"
-
-    os.environ[
-        "RAY_DEDUP_LOGS"
-    ] = "0"
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["RAY_DEDUP_LOGS"] = "0"
 
     os.makedirs(
         args.output_dir,
         exist_ok=True,
     )
 
-    # MATH-500 contains exactly 500 evaluation problems.
-    ds = load_dataset(
-        "HuggingFaceH4/MATH-500",
-        split="test",
-    )
+    rows = load_aime_rows(args.years)
 
     if args.limit is not None:
-        ds = ds.select(
-            range(
-                min(
-                    args.limit,
-                    len(ds),
-                )
-            )
+        rows = rows[: args.limit]
+        for i, row in enumerate(rows):
+            row["idx"] = i
+
+    print(
+        f"Loaded {len(rows)} AIME problems "
+        f"for years {args.years}",
+        flush=True,
+    )
+
+    counts = {}
+    for row in rows:
+        counts[row["year"]] = counts.get(row["year"], 0) + 1
+
+    for year in sorted(counts):
+        print(
+            f"  AIME {year}: {counts[year]} problems",
+            flush=True,
         )
 
-    rows = []
-
-    for i, x in enumerate(ds):
-        row = {
-            "idx": i,
-            "problem": x["problem"],
-            "ground_truth": x["answer"],
-        }
-
-        # Preserve metadata if present.
-        for key in [
-            "solution",
-            "subject",
-            "level",
-            "unique_id",
-        ]:
-            if key in x:
-                row[key] = x[key]
-
-        rows.append(row)
+    # Prevent stale rank*.jsonl files from an earlier run from contaminating
+    # the merged result.
+    for name in os.listdir(args.output_dir):
+        if name.startswith("rank") and name.endswith(".jsonl"):
+            os.remove(os.path.join(args.output_dir, name))
 
     # Round-robin split keeps workers similarly sized.
     shards = [
         rows[i::args.num_workers]
         for i in range(args.num_workers)
     ]
-
-    print(
-        f"Loaded {len(rows)} MATH-500 problems",
-        flush=True,
-    )
 
     print("BEFORE INIT", flush=True)
 
@@ -417,24 +504,19 @@ def main():
     print("AFTER INIT", flush=True)
 
     workers = [
-        VLLMMath500Worker.remote(
+        VLLMAIMEWorker.remote(
             rank=i,
             model=args.model,
             batch_size=args.batch_size,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
-            gpu_memory_utilization=(
-                args.gpu_memory_utilization
-            ),
+            gpu_memory_utilization=args.gpu_memory_utilization,
         )
         for i in range(args.num_workers)
     ]
 
-    print(
-        "LAUNCHED WORKERS",
-        flush=True,
-    )
+    print("LAUNCHED WORKERS", flush=True)
 
     futures = []
 
@@ -463,28 +545,31 @@ def main():
         args.output_dir,
         args.output_json,
         args.model,
+        args.years,
     )
 
     print("=" * 80)
-
     print(
         f"FINAL accuracy: "
         f"{final['correct']}/{final['total']} "
         f"= {final['accuracy']:.4f}"
     )
 
-    if final["subjects"]:
-        print("\nPer-subject accuracy:")
+    print("\nPer-year accuracy:")
+    for year, stats in sorted(final["per_year"].items()):
+        print(
+            f"AIME {year}: "
+            f"{stats['correct']:2d}/{stats['total']:2d} "
+            f"= {stats['accuracy']:.4f}"
+        )
 
-        for subject, stats in sorted(
-            final["subjects"].items()
-        ):
-            print(
-                f"{subject:25s}: "
-                f"{stats['correct']:3d}/"
-                f"{stats['total']:3d} "
-                f"= {stats['accuracy']:.4f}"
-            )
+    print("\nPer-exam accuracy:")
+    for exam, stats in sorted(final["per_exam"].items()):
+        print(
+            f"{exam:15s}: "
+            f"{stats['correct']:2d}/{stats['total']:2d} "
+            f"= {stats['accuracy']:.4f}"
+        )
 
     print(
         f"\nSaved JSON to: "

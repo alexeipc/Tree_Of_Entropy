@@ -2,19 +2,13 @@
 set -euo pipefail
 set -x
 
-# Force FlashInfer/vLLM to use the real native Ninja binary
-mkdir -p "$HOME/.local/ninja-bin"
-ln -sf /usr/bin/ninja "$HOME/.local/ninja-bin/ninja"
-
-export PATH="$HOME/.local/ninja-bin:$PATH"
-
-echo "Using ninja:"
-command -v ninja
-ninja --version
-
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=0
 #export PYTHONNOUSERSITE=1
+
+export WANDB_PROJECT=tree-of-entropy
+export WANDB_NAME=llama-3b
+
 
 export RAY_TMPDIR="/tmp/ray_${USER}_${SLURM_JOB_ID:-manual}"
 mkdir -p "$RAY_TMPDIR"
@@ -45,9 +39,18 @@ export RAY_DEDUP_LOGS=0
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python -m torch.distributed.run \
-    --standalone \
-    --nproc_per_node=8 \
-    dapo_deepmath.py
+#export HF_HOME=/scratch/pioneer/users/ptd18/cache
+#export HF_DATASETS_CACHE=/scratch/pioneer/users/ptd18/cache/datasets
+#export HF_HUB_CACHE=/scratch/pioneer/users/ptd18/cache/hub
+
+# mkdir -p "$HF_HOME" "$HF_DATASETS_CACHE" "$HF_HUB_CACHE"
+
+python aime_eval.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --num-workers 8 \
+    --batch-size 32 \
+    --max-tokens 2048 \
+    --temperature 0 \
+    --output-dir outputs/aime_qwen-outputs \
+    --output-json outputs/aime_qwen-results.json \
+    --year 2023 2024 \

@@ -11,19 +11,19 @@ from util.reward_func import reward as single_reward
 # Configuration
 # ============================================================
 
-MODEL_PATH = "meta-llama/Llama-3.1-8B-Instruct"
+MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
 
 OUTPUT_DIR = (
     "/scratch/pioneer/users/ptd18/models/"
-    "checkpoints/trl_grpo_deepmath_full_set_output"
+    "checkpoints/trl_grpo_qwen_deepmath_full_set_output"
 )
 
 FINAL_MODEL_DIR = (
     "/scratch/pioneer/users/ptd18/models/"
-    "trl_grpo_deepmath_full_set_final"
+    "trl_grpo_qwen_deepmath_full_set_final"
 )
 
-WANDB_PROJECT = "tree-of-entropy-llama-8b"
+WANDB_PROJECT = "tree-of-entropy-qwen-7b-deepmath"
 
 # ------------------------------------------------------------
 # Desired GRPO batch structure
@@ -33,23 +33,23 @@ WANDB_PROJECT = "tree-of-entropy-llama-8b"
 #
 # 6 × 8 = 48 completions/update
 #
-# 4 GPUs
+# 8 GPUs
 # 2 completions/GPU/microstep
 #
-# 2 × 4 = 8 completions/microstep
+# 2 × 8 = 16 completions/microstep
 #
-# 48 / 8 = 6 gradient accumulation microsteps
+# 48 / 16 = 3 gradient accumulation microsteps
 # ------------------------------------------------------------
 
 BATCH_SIZE = 6
 NUM_GENERATIONS = 8
 
 PER_DEVICE_TRAIN_BATCH_SIZE = 2
-GRADIENT_ACCUMULATION_STEPS = 6
+GRADIENT_ACCUMULATION_STEPS = 3
+
 GENERATION_BATCH_SIZE = 48
 
 MAX_COMPLETION_LENGTH = 2048
-
 CHECKPOINT_STEP = 100
 
 
@@ -247,12 +247,14 @@ def main():
         fsdp="full_shard auto_wrap",
 
         fsdp_config={
-            # Llama-3.1 transformer block class
+            # Qwen2.5 checkpoints use the qwen2 Transformers architecture.
+            # FSDP needs the exact decoder-layer class name in order to shard
+            # each transformer block instead of leaving the model unwrapped.
             "transformer_layer_cls_to_wrap": [
-                "LlamaDecoderLayer",
+                "Qwen2DecoderLayer",
             ],
 
-            # Wrap each Llama transformer block.
+            # Wrap each Qwen2 transformer block.
             "auto_wrap_policy": "transformer_based_wrap",
 
             # More memory-friendly backward behavior.
@@ -316,7 +318,7 @@ def main():
         logging_first_step=True,
 
         report_to=["wandb"],
-        run_name="raw-grpo-deepmath-llama-8b-full-set",
+        run_name="dapo-deepmath-qwen2.5-7b-full-set",
 
         # Needed because reward_func uses "answer".
         remove_unused_columns=False,
