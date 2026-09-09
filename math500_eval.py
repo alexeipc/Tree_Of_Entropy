@@ -41,39 +41,17 @@ def extract_last_boxed(text: str) -> Optional[str]:
 
 
 def extract_answer(text: str) -> Optional[str]:
-    # Prefer the last boxed answer.
-    boxed = extract_last_boxed(text)
-    if boxed is not None:
-        return boxed
-
-    # Fall back to explicitly formatted final answer.
-    m = re.findall(r"Final answer:\s*([^\n]+)", text, flags=re.I)
-    if m:
-        answer = m[-1].strip()
-
-        boxed = extract_last_boxed(answer)
-        if boxed is not None:
-            return boxed
-
-        return answer
-
-    return None
+    return extract_last_boxed(text)
 
 
 def make_messages(question: str):
+    user_message = (
+        f"{question}\n\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    )
     return [
         {
             "role": "user",
-            "content": (
-                "Solve the following math problem.\n"
-                "You must use this exact format:\n\n"
-                "<think>\n"
-                "Write your reasoning here.\n"
-                "</think>\n"
-                "Final answer: \\boxed{answer}\n\n"
-                "Problem:\n"
-                + question
-            ),
+            "content": user_message,
         }
     ]
 

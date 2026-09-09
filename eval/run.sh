@@ -2,16 +2,6 @@
 set -euo pipefail
 set -x
 
-# Force FlashInfer/vLLM to use the real native Ninja binary
-mkdir -p "$HOME/.local/ninja-bin"
-ln -sf /usr/bin/ninja "$HOME/.local/ninja-bin/ninja"
-
-export PATH="$HOME/.local/ninja-bin:$PATH"
-
-echo "Using ninja:"
-command -v ninja
-ninja --version
-
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=0
 #export PYTHONNOUSERSITE=1
@@ -49,11 +39,16 @@ export RAY_DEDUP_LOGS=0
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
-#python deepmath_trainer.py
-python openthoughts_trainer.py
-#python warmup_gpu.py
+BASE_MODEL="Qwen/Qwen3-8B"
+EXP_DIR="/scratch/pioneer/users/ptd18/eval/aime24/Qwuen3-8B/base"
 
-#CUDA_VISIBLE_DEVICES=0,1,2 python test_sync.py
-#python test_main_copy.py
-#python sft_eval.py
-#CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run  --master_port=29517 --nproc_per_node=3 raw_grpo.py
+# evaluate base model performance
+NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python evaluate_math.py \
+    --base_model "$BASE_MODEL" \
+    --dataset "aime24" \
+    --val_n 12 \
+    --temperature 1.0 \
+    --tensor_parallel_size 8 \
+    --max_model_len 38912 \
+    --top_p 0.95
+wait 

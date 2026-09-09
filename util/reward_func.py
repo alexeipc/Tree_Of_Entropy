@@ -128,41 +128,23 @@ def has_correct_format(text: str) -> bool:
 
 
 def reward(response: str, ground_truth: str) -> float:
-    # Boxed answer must appear after </think>
-    boxed_answer_after_think = extract_boxed_after_think(response)
+    # Last boxed answer anywhere in the assistant response. No format
+    # requirement (e.g. no <think>/</think> needed) — only the final
+    # answer matters.
+    boxed_answer = extract_last_boxed(get_assistant_only(response))
 
-    # Last boxed answer anywhere after <think>
-    # Kept only for debugging / inspection.
-    boxed_answer = extract_last_boxed_after_open_think(response)
-
-    # Format reward
-    format_reward = (
-        0.5
-        if boxed_answer_after_think is not None
-        else 0.0
-    )
-
-    # Final-answer correctness reward
-    pre_correct_reward = (
+    score = (
         1.0
         if (
-            boxed_answer_after_think is not None
-            and grade_answer(
-                boxed_answer_after_think,
-                ground_truth
-            )
+            boxed_answer is not None
+            and grade_answer(boxed_answer, ground_truth)
         )
         else 0.0
     )
 
-    score = format_reward + pre_correct_reward
-
     debug("*" * 80)
     debug("GT:", ground_truth)
     debug("PRED:", boxed_answer)
-    debug("FORMAT_PRED:", boxed_answer_after_think)
-    debug("FORMAT:", format_reward)
-    debug("CORRECT:", pre_correct_reward)
     debug("SCORE:", score)
     debug(
         "Assistant response:\n",

@@ -45,6 +45,10 @@ def get_decoder_layer_cls(model):
         from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
         return Qwen2DecoderLayer
 
+    if model_type == "qwen3":
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+        return Qwen3DecoderLayer
+
     raise ValueError(
         f"Unsupported model architecture {model_type!r}. "
         "Add its decoder layer class to get_decoder_layer_cls()."

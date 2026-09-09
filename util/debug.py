@@ -1,4 +1,4 @@
-IS_DEBUG = True
+IS_DEBUG = False
 
 def debug(*args, **kwargs):
     if IS_DEBUG:
