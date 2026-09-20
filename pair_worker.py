@@ -1,4 +1,5 @@
 import os
+import sys
 import ray
 import torch
 import torch.distributed as dist
@@ -165,7 +166,9 @@ class RolloutActor(AbstractRolloutWeightSync):
             llm=self.llm,
             eos_id=self.tokenizer.eos_token_id,
             tree_reward_manager=tree_reward_manager,
+            tokenizer=self.tokenizer,
             teacher_submitter=submit_teacher_request,
+            batch_size=256,
         )
         
         groups = {}
@@ -214,23 +217,92 @@ class RolloutActor(AbstractRolloutWeightSync):
             item["response_length"]
             for item in rollout_items
         )
+        avg_response_length = (
+            total_response_length / len(rollout_items)
+            if rollout_items
+            else 0.0
+        )
         avg_rollouts_per_prompt = (
             len(rollout_items) / len(input_ids)
             if input_ids
             else 0.0
         )
-        
+        eos_rate = (
+            sum(item["hit_eos"] for item in rollout_items)
+            / len(rollout_items)
+            if rollout_items
+            else 0.0
+        )
+
         return (
             tree_reward_manager,
             input_ids,
             mean_reward,
             mean_teacher_reward,
             total_response_length,
+            avg_response_length,
             avg_rollouts_per_prompt,
+            eos_rate,
         )
     
     def get_vllm_engine(self):
         return self.llm
+
+    def eval_dataset(
+        self,
+        dataset_name: str = "aime25",
+        max_new_tokens: int = 16000,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        val_n: int = 4,
+        enable_thinking: bool = True,
+    ):
+        """
+        Score the current policy on a held-out math benchmark using the
+        rollout engine already loaded on this actor (kept in sync with the
+        trainer via nccl_sync), instead of spinning up a separate vLLM
+        instance that would compete for GPUs with training.
+        """
+        eval_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "eval",
+        )
+        if eval_dir not in sys.path:
+            sys.path.insert(0, eval_dir)
+        from evaluate_math import evaluate_math500
+
+        average_at_n_pct, results = evaluate_math500(
+            self.llm,
+            self.tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            dataset_name=dataset_name,
+            enable_thinking=enable_thinking,
+            val_n=val_n,
+        )
+
+        num_problems = len(results)
+        pass_at_n_pct = (
+            100.0 * sum(1 for r in results if r["pass_at_n"]) / num_problems
+            if num_problems
+            else 0.0
+        )
+        majority_vote_at_n_pct = (
+            100.0
+            * sum(1 for r in results if r["majority_vote_correct"])
+            / num_problems
+            if num_problems
+            else 0.0
+        )
+
+        return {
+            "average_at_n_pct": average_at_n_pct,
+            "pass_at_n_pct": pass_at_n_pct,
+            "majority_vote_at_n_pct": majority_vote_at_n_pct,
+            "num_problems": num_problems,
+            "val_n": val_n,
+        }
 
     def rebuild_vllm_engine(self, model_path: str) -> None:
         del self.llm
@@ -315,7 +387,7 @@ class BaseTeacherActor:
             sampling_params=SamplingParams(
                 temperature=0.6,
                 top_p=0.95,
-                max_tokens=2048,
+                max_tokens=16000,
                 n=n_values.pop(),
             ),
         )
@@ -465,7 +537,7 @@ class FSDPTrainerActor(AbstractFSDPWeightSync):
             check_fn=lambda module: isinstance(module, decoder_layer_cls),
         )
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=5e-6)
 
         self.alpha = 0.01
         self.eps_clip = 0.05
@@ -640,10 +712,10 @@ class FSDPTrainerActor(AbstractFSDPWeightSync):
 
         return loss, entropy_sum, entropy_count
 
-    def process_batch(self, batch, mini_batch_size, epoch=1):
+    def process_batch(self, batch, max_tokens_per_mini_batch, epoch=1):
         n_total_tokens, mini_batches = TreeRewardManager.process_batch(
             batch,
-            mini_batch_size,
+            max_tokens_per_mini_batch,
         )
 
         self.model.eval()
@@ -831,19 +903,15 @@ class RLController(AbstractWeightSyncController):
             
         debug("DONE TRAVERSING")
 
-        # Match the trainer's length-sorted mini-batches. This bounds base
-        # teacher memory and ensures every stored row has the same padded
-        # width as the corresponding policy mini-batch.
-        sorted_batch = sorted(batch, key=lambda x: len(x["input_ids"]))
-        optimizer_mini_batch_size = 4
-        teacher_batches = [
-            sorted_batch[start:start + optimizer_mini_batch_size]
-            for start in range(
-                0,
-                len(sorted_batch),
-                optimizer_mini_batch_size,
-            )
-        ]
+        # Match the trainer's token-budget mini-batches exactly. This bounds
+        # base teacher memory and ensures every stored row has the same
+        # padded width as the corresponding policy mini-batch, since both
+        # sides bucket the same sorted batch with the same token budget.
+        max_tokens_per_mini_batch = 8192
+        teacher_batches = TreeRewardManager.bucket_by_token_budget(
+            batch,
+            max_tokens_per_mini_batch,
+        )
         entropy_batches = ray.get([
             self.entropy.calculate_entropies.remote(items)
             for items in teacher_batches
@@ -855,7 +923,7 @@ class RLController(AbstractWeightSyncController):
         trainer_stats = ray.get([
             self.trainers[i].process_batch.remote(
                 batch,
-                optimizer_mini_batch_size,
+                max_tokens_per_mini_batch,
             )
             for i in range(self.world_size)
         ])
@@ -870,7 +938,9 @@ class RLController(AbstractWeightSyncController):
             mean_reward,
             mean_teacher_reward,
             total_response_length,
+            avg_response_length,
             avg_rollouts_per_prompt,
+            eos_rate,
         ) = self.rollout_samples(
             prompts,
             ground_truths,
@@ -905,14 +975,27 @@ class RLController(AbstractWeightSyncController):
             "reward/mean": mean_reward,
             "teacher_reward/mean": mean_teacher_reward,
             "rollout/total_response_length": total_response_length,
+            "rollout/avg_response_length": avg_response_length,
             "rollout/avg_rollouts_per_prompt": avg_rollouts_per_prompt,
+            "rollout/eos_rate": eos_rate,
+            "rollout/truncated_rate": 1.0 - eos_rate,
             "rollout/avg_response_entropy": (
                 entropy_sum / entropy_count if entropy_count else 0.0
             ),
             "time/rollout_seconds": rollout_seconds,
             "time/optimizer_seconds": optimizer_seconds,
         }
-    
+
+    def eval_aime25(self, **kwargs):
+        """
+        Run eval/evaluate_math.py's AIME25 scoring logic against the
+        rollout actor's already-loaded engine, so this doesn't need to
+        allocate a separate vLLM instance/GPUs just for eval.
+        """
+        return ray.get(
+            self.rollout.eval_dataset.remote(dataset_name="aime25", **kwargs)
+        )
+
     @property
     def rollout_actor(self):
         return self.rollout

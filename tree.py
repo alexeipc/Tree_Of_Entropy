@@ -1,13 +1,12 @@
-from multiprocessing import shared_memory
 from typing import Any, Callable, Optional
 
-import numpy as np
 import torch
 from vllm import LLM, SamplingParams
 
 from opsd.opsd import OPSD
 from tree_reward import TreeRewardManager
 from util.debug import debug
+from util.entropy import calculate_entropy
 from util.jsd_sparse import future_disagreement
 from util.reward_func import reward
 
@@ -33,12 +32,14 @@ class Tree:
         llm: LLM,
         eos_id: int,
         tree_reward_manager: TreeRewardManager,
+        tokenizer,
         branching_threshold: float = 0.15,
-        batch_size: int = 64,
+        batch_size: int = 256,
         teacher_submitter: Optional[Callable] = None,
     ):
         self.llm = llm
         self.eos_id = int(eos_id)
+        self.tokenizer = tokenizer
 
         self.n_branch = 2
         self.max_depth = 5
@@ -52,7 +53,7 @@ class Tree:
         self.batch_size = batch_size
 
         # Maximum number of tokens generated after the original input.
-        self.max_generated_length = 3500
+        self.max_generated_length = 8192
 
     # ------------------------------------------------------------------
     # Reward normalization
@@ -153,7 +154,7 @@ class Tree:
             node = self.manager.add_node(input_ids)
             leaf_counts.append(node.count_branches())
 
-        teacher_n_generations = min(4,max(leaf_counts))
+        teacher_n_generations = min(2,max(leaf_counts))
         debug(
             "TEACHER GENERATIONS (MAX STUDENT LEAF COUNT): "
             f"{teacher_n_generations}; LEAF COUNTS: {leaf_counts}"
@@ -198,14 +199,8 @@ class Tree:
         self,
         input_ids: torch.Tensor,
         completion,
-        remove_last_token: bool,
     ) -> torch.Tensor:
-        generated_ids = completion.token_ids
-
-        if remove_last_token:
-            generated_ids = generated_ids[:-1]
-
-        generated_ids = self._to_long_cpu_tensor(generated_ids)
+        generated_ids = self._to_long_cpu_tensor(completion.token_ids)
         input_ids = self._to_long_cpu_tensor(input_ids)
 
         return torch.cat(
@@ -242,40 +237,18 @@ class Tree:
         """
         Generate one chunk from the current BFS layer.
 
-        Returns:
-            outputs, stop_entropies
+        Every request is generated in full (to natural EOS or its
+        remaining-token budget) so that the branch point can be chosen
+        afterwards from the whole sequence's per-token entropy.
         """
-        num_requests = len(requests)
-
-        if num_requests == 0:
-            return [], []
-
-        entropy_shm = shared_memory.SharedMemory(
-            create=True,
-            size=num_requests * np.dtype(np.float64).itemsize,
-        )
-
-        stop_entropies_shared = np.ndarray(
-            (num_requests,),
-            dtype=np.float64,
-            buffer=entropy_shm.buf,
-        )
-        stop_entropies_shared[:] = np.nan
+        if not requests:
+            return []
 
         prompts = [request["prompt"] for request in requests]
         sampling_params = []
 
-        for slot, request in enumerate(requests):
+        for request in requests:
             input_ids = request["input_ids"]
-            depth = request["depth"]
-            threshold = request["threshold"]
-
-            effective_threshold = (
-                threshold
-                if depth < self.max_depth
-                else float("inf")
-            )
-
             initial_input_length = request["initial_input_length"]
             generated_so_far = max(
                 0,
@@ -293,37 +266,17 @@ class Tree:
 
             sampling_params.append(
                 SamplingParams(
-                    temperature=0.6,
+                    temperature=1.1,
                     top_p=0.95,
                     max_tokens=max_tokens,
                     logprobs=19,
-                    extra_args={
-                        "entropy_threshold": float(
-                            effective_threshold
-                        ),
-                        "entropy_eos_token_id": self.eos_id,
-                        "entropy_shm_name": entropy_shm.name,
-                        "entropy_slot": slot,
-                        "entropy_num_slots": num_requests,
-                    },
                 )
             )
 
-        try:
-            outputs = self.llm.generate(
-                prompts=prompts,
-                sampling_params=sampling_params,
-            )
-
-            stop_entropies = [
-                None if np.isnan(value) else float(value)
-                for value in stop_entropies_shared.copy()
-            ]
-        finally:
-            entropy_shm.close()
-            entropy_shm.unlink()
-
-        return outputs, stop_entropies
+        return self.llm.generate(
+            prompts=prompts,
+            sampling_params=sampling_params,
+        )
 
     def _generate_layer(
         self,
@@ -336,7 +289,6 @@ class Tree:
         starts until every request in this layer has completed.
         """
         all_outputs = []
-        all_stop_entropies = []
 
         for start_idx in range(
             0,
@@ -355,10 +307,9 @@ class Tree:
                 f"{start_idx}:{end_idx} / {len(layer_queue)}"
             )
 
-            outputs, stop_entropies = self._generate_batch(chunk)
+            outputs = self._generate_batch(chunk)
 
             all_outputs.extend(outputs)
-            all_stop_entropies.extend(stop_entropies)
 
         if len(all_outputs) != len(layer_queue):
             raise RuntimeError(
@@ -367,7 +318,63 @@ class Tree:
                 f"layer={len(layer_queue)}"
             )
 
-        return all_outputs, all_stop_entropies
+        return all_outputs
+
+    # ------------------------------------------------------------------
+    # Entropy-based branch-point selection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _token_entropies(completion) -> torch.Tensor:
+        """
+        Per-token entropy for every position in a full completion, computed
+        from the top-k logprobs vLLM returns for each generated token.
+        """
+        entropies = [
+            calculate_entropy(
+                torch.tensor(
+                    [lp.logprob for lp in position_logprobs.values()],
+                    dtype=torch.float32,
+                )
+            )
+            for position_logprobs in completion.logprobs
+        ]
+
+        return torch.stack(entropies)
+
+    def _select_branch_cut(
+        self,
+        entropies: torch.Tensor,
+        depth: int,
+        threshold: float,
+    ) -> tuple[int, float]:
+        """
+        Pick the token position to branch at.
+
+        If the sequence's highest entropy exceeds `threshold`, branch at the
+        first token whose entropy exceeds it. Otherwise, fall back to the
+        first token among the `g = max_depth - depth` highest-entropy
+        tokens in the sequence — this guarantees a branch point always
+        exists, so every path is forced to reach max_depth.
+
+        Returns (cut_index, cut_entropy), where cut_index is the position of
+        the first token *not* included in the branching prefix.
+        """
+        max_entropy = entropies.max().item()
+
+        if max_entropy > threshold:
+            candidates = torch.where(entropies > threshold)[0]
+        else:
+            g = min(
+                max(self.max_depth - depth, 1),
+                entropies.numel(),
+            )
+            cut_value = torch.topk(entropies, g).values.min()
+            candidates = torch.where(entropies >= cut_value)[0]
+
+        cut_index = candidates[0].item()
+
+        return cut_index, entropies[cut_index].item()
 
     # ------------------------------------------------------------------
     # Batched branching probes
@@ -414,7 +421,7 @@ class Tree:
                 SamplingParams(
                     n=self.n_branch,
                     max_tokens=max(1, min(10, remaining_tokens)),
-                    temperature=0.6,
+                    temperature=1.1,
                     top_p=0.95,
                     logprobs=10,
                 )
@@ -540,6 +547,11 @@ class Tree:
         node.wrong_answer = 1 - node.correct_answer
         node.is_leaf = True
 
+        hit_eos = bool(
+            ids.numel() > 0
+            and int(ids[-1].item()) == self.eos_id
+        )
+
         groups.setdefault(group_id, []).append(
             {
                 "reward": reward_score,
@@ -548,6 +560,7 @@ class Tree:
                     0,
                     len(ids) - initial_input_length,
                 ),
+                "hit_eos": hit_eos,
             }
         )
 
@@ -722,20 +735,17 @@ class Tree:
             )
             debug("=" * 80)
 
-            outputs, stop_entropies = self._generate_layer(
-                current_layer_queue
-            )
+            outputs = self._generate_layer(current_layer_queue)
 
             next_layer_queue = []
 
-            # Requests that crossed the entropy threshold are collected
-            # first, then all disagreement probes are generated together.
+            # Requests picked for branching are collected first, then all
+            # disagreement probes are generated together.
             crossing_requests = []
 
-            for request, output, stop_entropy in zip(
+            for request, output in zip(
                 current_layer_queue,
                 outputs,
-                stop_entropies,
             ):
                 completion = output.outputs[0]
 
@@ -745,13 +755,26 @@ class Tree:
                 parent_ids = request["parent_ids"]
                 return_slot = request["return_slot"]
                 initial_input_length = request["initial_input_length"]
+                depth = request["depth"]
 
-                if stop_entropy is None:
-                    # EOS or max token limit: save a completed leaf.
+                # Below max_depth, every generated sequence is forced to
+                # branch, so every path is guaranteed to reach max_depth. At
+                # max_depth (or if generation produced no tokens at all),
+                # the completion is saved as a leaf as-is.
+                cut_index = None
+
+                if depth < self.max_depth and len(completion.token_ids) > 0:
+                    entropies = self._token_entropies(completion)
+                    cut_index, cut_entropy = self._select_branch_cut(
+                        entropies=entropies,
+                        depth=depth,
+                        threshold=request["threshold"],
+                    )
+
+                if cut_index is None:
                     node_ids = self._join_completion(
                         input_ids=old_input_ids,
                         completion=completion,
-                        remove_last_token=False,
                     )
 
                     full_prompt = prompt + completion.text
@@ -771,12 +794,16 @@ class Tree:
 
                     continue
 
-                # Threshold crossing: remove the custom stopping token from
-                # the stored node IDs, matching the original implementation.
-                node_ids = self._join_completion(
-                    input_ids=old_input_ids,
-                    completion=completion,
-                    remove_last_token=True,
+                # Branch cut: keep only the tokens generated before the
+                # token that triggered branching.
+                prefix_token_ids = completion.token_ids[:cut_index]
+
+                node_ids = torch.cat(
+                    [
+                        self._to_long_cpu_tensor(old_input_ids),
+                        self._to_long_cpu_tensor(prefix_token_ids),
+                    ],
+                    dim=0,
                 )
 
                 if parent_ids is not None:
@@ -790,14 +817,8 @@ class Tree:
                 if return_slot is not None:
                     return_node_ids[return_slot] = node_ids
 
-                next_prompt = prompt + completion.text
-
-                self._add_to_teacher_queue(
-                    teacher_queue=teacher_queue,
-                    message=next_prompt,
-                    reference_answer=reference_answers[group_id],
-                    gt=gts[group_id],
-                    input_ids=node_ids,
+                next_prompt = prompt + self.tokenizer.decode(
+                    prefix_token_ids
                 )
 
                 crossing_requests.append(
@@ -805,8 +826,8 @@ class Tree:
                         "node_ids": node_ids,
                         "next_prompt": next_prompt,
                         "group_id": group_id,
-                        "threshold": stop_entropy,
-                        "depth": request["depth"],
+                        "threshold": cut_entropy,
+                        "depth": depth,
                         "initial_input_length": initial_input_length,
                     }
                 )
@@ -827,6 +848,15 @@ class Tree:
                 next_depth = crossing["depth"] + int(
                     actual_branch
                 )
+
+                if actual_branch:
+                    self._add_to_teacher_queue(
+                        teacher_queue=teacher_queue,
+                        message=crossing["next_prompt"],
+                        reference_answer=reference_answers[group_id],
+                        gt=gts[group_id],
+                        input_ids=crossing["node_ids"],
+                    )
 
                 for next_prompt, child_ids in branch_result[1:]:
                     if len(child_ids) <= len(parent_node_ids):

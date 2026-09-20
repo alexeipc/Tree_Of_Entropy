@@ -60,10 +60,11 @@ class OPSD:
         teacher_prefixes = [prefix.to(device) for prefix in teacher_prefixes]
 
         teacher_sequences: list[torch.Tensor] = []
-        teacher_reward_masks: list[torch.Tensor] = []
 
         # Information needed to map teacher entropy back to student positions.
         student_shift_masks: list[torch.Tensor] = []
+        prefix_lengths: list[int] = []
+        completion_lengths: list[int] = []
 
         for i, (student_sequence, student_reward_mask, teacher_prefix) in enumerate(
             zip(sequences, reward_masks, teacher_prefixes)
@@ -108,36 +109,17 @@ class OPSD:
                 dim=0,
             )
 
-            teacher_reward_mask = torch.cat(
-                [
-                    torch.zeros(
-                        teacher_prefix.numel(),
-                        dtype=torch.bool,
-                    ),
-                    torch.ones(
-                        completion_ids.numel(),
-                        dtype=torch.bool,
-                    ),
-                ],
-                dim=0,
-            )
-
             teacher_sequences.append(teacher_sequence)
-            teacher_reward_masks.append(teacher_reward_mask)
 
             # Shifted because logits[:, t] predict token at position t + 1.
             student_shift_masks.append(student_reward_mask[1:])
+            prefix_lengths.append(teacher_prefix.numel())
+            completion_lengths.append(completion_ids.numel())
 
         teacher_input_ids = pad_sequence(
             teacher_sequences,
             batch_first=True,
             padding_value=pad_token_id,
-        )
-
-        teacher_reward_mask = pad_sequence(
-            teacher_reward_masks,
-            batch_first=True,
-            padding_value=False,
         )
 
         teacher_lengths = torch.tensor(
@@ -156,7 +138,6 @@ class OPSD:
 
         teacher_input_ids = teacher_input_ids.to(device)
         teacher_attention_mask = teacher_attention_mask.to(device)
-        teacher_reward_mask = teacher_reward_mask.to(device)
 
         with torch.no_grad():
             outputs = hf_model(
@@ -173,34 +154,44 @@ class OPSD:
                 shift_teacher_logits
             )
 
-            # Select entropies according to the token being predicted.
-            shift_teacher_reward_mask = teacher_reward_mask[:, 1:]
-            shift_teacher_attention_mask = teacher_attention_mask[:, 1:]
-
-            valid_teacher_completion_mask = (
-                shift_teacher_reward_mask
-                & shift_teacher_attention_mask
-            )
-
         student_aligned_entropies: list[torch.Tensor] = []
 
         for i, student_shift_mask in enumerate(student_shift_masks):
-            # These correspond exactly to the shared completion tokens.
-            completion_entropies = teacher_entropies[i][
-                valid_teacher_completion_mask[i]
-            ]
+            prefix_len = prefix_lengths[i]
+            completion_len = completion_lengths[i]
 
             expected_completion_tokens = int(
                 student_shift_mask.sum().item()
             )
 
-            if completion_entropies.numel() != expected_completion_tokens:
+            if completion_len != expected_completion_tokens:
                 raise RuntimeError(
-                    f"Sample {i}: teacher produced "
-                    f"{completion_entropies.numel()} completion entropies, "
+                    f"Sample {i}: completion has {completion_len} tokens, "
                     f"but student alignment expects "
                     f"{expected_completion_tokens}."
                 )
+
+            # Position of each completion token within the teacher sequence.
+            completion_positions = torch.arange(
+                prefix_len,
+                prefix_len + completion_len,
+                device=device,
+            )
+
+            # logits at position (p - 1) predict the token at position p, so
+            # a completion token at position 0 (only possible when the
+            # teacher prefix is empty, e.g. a continuation node with no
+            # privileged teacher generation of its own) has no predicting
+            # logit at all - leave its entropy at 0 instead of misaligning
+            # every later token by reading from a boolean-masked selection.
+            has_predicting_logit = completion_positions >= 1
+            logit_positions = (completion_positions - 1).clamp(min=0)
+
+            completion_entropies = torch.where(
+                has_predicting_logit,
+                teacher_entropies[i, logit_positions],
+                torch.zeros_like(teacher_entropies[i, logit_positions]),
+            )
 
             # Output is aligned with the student's shifted logits.
             #

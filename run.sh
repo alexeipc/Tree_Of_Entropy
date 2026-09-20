@@ -26,6 +26,23 @@ unset RAY_ADDRESS
 
 ray stop --force --temp-dir="$RAY_TMPDIR" 2>/dev/null || true
 
+
+# ============================================================
+# Hugging Face cache -> scratch
+# ============================================================
+
+export HF_HOME="/scratch/pioneer/users/ptd18/cache/huggingface"
+export HF_HUB_CACHE="$HF_HOME/hub"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export TRANSFORMERS_CACHE="$HF_HOME/transformers"
+
+mkdir -p \
+    "$HF_HOME" \
+    "$HF_HUB_CACHE" \
+    "$HF_DATASETS_CACHE" \
+    "$TRANSFORMERS_CACHE"
+
+
 # Triton needs this to find libcuda.so.1
 export TRITON_LIBCUDA_PATH="$HOME/cuda-compat-fake"
 export TRITON_CACHE_DIR="$HOME/.triton/cache"
@@ -56,4 +73,7 @@ python openthoughts_trainer.py
 #CUDA_VISIBLE_DEVICES=0,1,2 python test_sync.py
 #python test_main_copy.py
 #python sft_eval.py
-#CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run  --master_port=29517 --nproc_per_node=3 raw_grpo.py
+#CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run \
+#    --master_port=29517 \
+#    --nproc_per_node=3 \
+#    raw_grpo.py

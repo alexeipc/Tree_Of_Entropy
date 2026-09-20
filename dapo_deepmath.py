@@ -1,29 +1,30 @@
 import os
 
 from datasets import load_dataset
+from mathruler.grader import grade_answer
 from transformers import AutoTokenizer
 from trl import GRPOTrainer, GRPOConfig
 
-from util.reward_func import reward as single_reward
+from util.reward_func import reward as single_reward, extract_last_boxed
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_PATH = "Qwen/Qwen3-8B"
 
 OUTPUT_DIR = (
     "/scratch/pioneer/users/ptd18/models/"
-    "checkpoints/trl_grpo_qwen_deepmath_full_set_output"
+    "checkpoints/trl_grpo_qwen_openthoughts_full_set_output"
 )
 
 FINAL_MODEL_DIR = (
     "/scratch/pioneer/users/ptd18/models/"
-    "trl_grpo_qwen_deepmath_full_set_final"
+    "trl_grpo_qwen_openthoughts_full_set_final"
 )
 
-WANDB_PROJECT = "tree-of-entropy-qwen-7b-deepmath"
+WANDB_PROJECT = "tree-of-entropy-qwen-7b-openthoughts"
 
 # ------------------------------------------------------------
 # Desired GRPO batch structure
@@ -119,10 +120,46 @@ def reward_func(completions, answer, **kwargs):
 # Dataset
 # ============================================================
 
+DATASET_NAME = "siyanzhao/Openthoughts_math_30k_opsd"
+
+
+def normalize_final_answer(answer) -> str:
+    if answer is None:
+        return ""
+
+    return str(answer).strip()
+
+
+def has_matching_reference_solution(sample) -> bool:
+    """Keep only rows whose solution's boxed result matches Answer."""
+    ground_truth = normalize_final_answer(sample.get("Answer"))
+    if not ground_truth:
+        return False
+
+    solution = sample.get("solution")
+    if solution is None:
+        return False
+
+    solution = str(solution).strip()
+    if not solution:
+        return False
+
+    predicted_answer = extract_last_boxed(solution)
+    return (
+        predicted_answer is not None
+        and grade_answer(predicted_answer, ground_truth)
+    )
+
+
 def build_dataset():
     dataset = load_dataset(
-        "zwhe99/DeepMath-103K",
+        DATASET_NAME,
         split="train",
+    )
+
+    dataset = dataset.filter(
+        has_matching_reference_solution,
+        num_proc=8,
     )
 
     def format_sample(sample):
@@ -138,11 +175,11 @@ def build_dataset():
                         "</think>\n"
                         "Final answer: \\boxed{answer}\n\n"
                         "Problem:\n"
-                        + str(sample["question"])
+                        + str(sample["problem"])
                     ),
                 }
             ],
-            "answer": str(sample["final_answer"]).strip(),
+            "answer": normalize_final_answer(sample["Answer"]),
         }
 
     dataset = dataset.map(format_sample)
@@ -247,14 +284,14 @@ def main():
         fsdp="full_shard auto_wrap",
 
         fsdp_config={
-            # Qwen2.5 checkpoints use the qwen2 Transformers architecture.
+            # Qwen3 checkpoints use the qwen3 Transformers architecture.
             # FSDP needs the exact decoder-layer class name in order to shard
             # each transformer block instead of leaving the model unwrapped.
             "transformer_layer_cls_to_wrap": [
-                "Qwen2DecoderLayer",
+                "Qwen3DecoderLayer",
             ],
 
-            # Wrap each Qwen2 transformer block.
+            # Wrap each Qwen3 transformer block.
             "auto_wrap_policy": "transformer_based_wrap",
 
             # More memory-friendly backward behavior.
@@ -304,6 +341,10 @@ def main():
         # ----------------------------------------------------
         # Generation
         # ----------------------------------------------------
+        use_vllm=True,
+        vllm_mode="server",
+        vllm_server_port=int(os.environ.get("VLLM_SERVER_PORT", 8000)),
+
         max_completion_length=MAX_COMPLETION_LENGTH,
 
         temperature=0.8,
@@ -318,7 +359,7 @@ def main():
         logging_first_step=True,
 
         report_to=["wandb"],
-        run_name="dapo-deepmath-qwen2.5-7b-full-set",
+        run_name="dapo-openthoughts-qwen2.5-7b-full-set",
 
         # Needed because reward_func uses "answer".
         remove_unused_columns=False,

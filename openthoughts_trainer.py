@@ -10,14 +10,20 @@ import random
 import ray
 
 
-# Change this to your actual 8B checkpoint.
-BASE_MODEL_PATH = "Qwen/Qwen3-8B"
-CHECKPOINT_DIR = "/scratch/pioneer/users/ptd18/models/checkpoints/tuned-qwen-toe-opsd-openthoughts-math-30k-no-sft-1024-max-length"
+# Change this to your actual 1.7B checkpoint.
+BASE_MODEL_PATH = "Qwen/Qwen3-1.7B"
+CHECKPOINT_DIR = "/scratch/pioneer/users/ptd18/models/checkpoints/tuned-qwen3-1.7B-toe-opsd-openthoughts-math-30k-no-sft-16000-max-length-temp-1.1"
 
-BATCH_SIZE = 6
-CHECKPOINT_STEP = 500
-UPDATE_STEP = 3
-NUM_STEPS = None
+BATCH_SIZE = 32
+CHECKPOINT_STEP = 25
+UPDATE_STEP = 1
+NUM_STEPS = 500
+
+# AIME25 eval, run every CHECKPOINT_STEP steps on the rollout actor's
+# already-loaded engine (no extra GPUs needed).
+RUN_EVAL = False
+EVAL_VAL_N = 12
+EVAL_MAX_NEW_TOKENS = 16000
 
 # Number of already completed batches.
 # For example, 500 means batches 0 through 499 were already completed.
@@ -116,7 +122,7 @@ if __name__ == "__main__":
             "dataset": DATASET_NAME,
             "dataset_size": len(dataset),
             "dataset_seed": DATASET_SEED,
-            "lr": 1e-6,
+            "lr": 5e-6,
             "alpha": 0.1,
             "eps_clip": 0.05,
             "batch_size": BATCH_SIZE,
@@ -260,8 +266,15 @@ if __name__ == "__main__":
                 "rollout/total_response_length": stats[
                     "rollout/total_response_length"
                 ],
+                "rollout/avg_response_length": stats[
+                    "rollout/avg_response_length"
+                ],
                 "rollout/avg_rollouts_per_prompt": stats[
                     "rollout/avg_rollouts_per_prompt"
+                ],
+                "rollout/eos_rate": stats["rollout/eos_rate"],
+                "rollout/truncated_rate": stats[
+                    "rollout/truncated_rate"
                 ],
                 "rollout/avg_response_entropy": stats[
                     "rollout/avg_response_entropy"
@@ -291,8 +304,34 @@ if __name__ == "__main__":
                 )
             )
 
+            if RUN_EVAL:
+                debug("=" * 80)
+                debug("RUNNING AIME25 EVAL")
+                eval_stats = controller.eval_aime25(
+                    val_n=EVAL_VAL_N,
+                    max_new_tokens=EVAL_MAX_NEW_TOKENS,
+                )
+                debug("DONE AIME25 EVAL")
+                debug(eval_stats)
+                debug("=" * 80)
+
+                wandb.log(
+                    {
+                        "eval/aime25/average_at_n_pct": eval_stats[
+                            "average_at_n_pct"
+                        ],
+                        "eval/aime25/pass_at_n_pct": eval_stats[
+                            "pass_at_n_pct"
+                        ],
+                        "eval/aime25/majority_vote_at_n_pct": eval_stats[
+                            "majority_vote_at_n_pct"
+                        ],
+                    },
+                    step=current_step,
+                )
+
     controller.save_and_sync(
-        "./checkpoints/final-qwen-toe-opsd-openthoughts-math-30k"
+        "/scratch/pioneer/users/ptd18/models/checkpoints/tuned-qwen3-1.7B-toe-opsd-openthoughts-math-30k-no-sft-16000-max-length-temp-1.1/final"
     )
 
     wandb.finish()

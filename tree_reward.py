@@ -87,11 +87,18 @@ class TreeRewardManager:
                 return clip(ratio, 1 - delta, 1 + delta)
             
             
-            h_target_ratio = safe_ratio(
-                self.teacher_acc,
-                success_rate,
-                self.small_delta,
-            )
+            # Nodes whose parent crossing never actually branched are never
+            # queued for a teacher generation, so they have no teacher_acc
+            # to compare against. Fall back to a neutral ratio (no H_target
+            # adjustment) instead of comparing against a missing value.
+            if self.teacher_acc is None:
+                h_target_ratio = 1.0
+            else:
+                h_target_ratio = safe_ratio(
+                    self.teacher_acc,
+                    success_rate,
+                    self.small_delta,
+                )
             debug(success_rate)
             debug(self.teacher_acc)
             debug(h_target_ratio)
@@ -119,10 +126,22 @@ class TreeRewardManager:
     def add_teacher_ids(self, input_ids, teacher_ids, teacher_acc):
         node = self.add_node(input_ids=input_ids)
         self.teacher_rewards.append(float(teacher_acc))
-        
-        for child in node.children:
-            child.teacher_ids = teacher_ids
-            child.teacher_acc = teacher_acc
+
+        # A node with exactly one child is a continuation that never
+        # actually branched, so it was never queued for its own teacher
+        # comparison. Keep propagating this same teacher_acc down through
+        # such continuations until the next real branch (>1 children),
+        # which will overwrite it with its own, fresher teacher_acc once
+        # its teacher request resolves.
+        def propagate(parent):
+            for child in parent.children:
+                child.teacher_ids = teacher_ids
+                child.teacher_acc = teacher_acc
+
+                if len(child.children) == 1:
+                    propagate(child)
+
+        propagate(node)
 
     def add_child(self, parent_ids, child_ids):
         parent = self.add_node(parent_ids)
@@ -161,13 +180,23 @@ class TreeRewardManager:
             reward_mask = torch.zeros_like(input_ids, dtype=torch.long)
             reward_mask[prev_len:] = 1
             
+            # Nodes whose parent crossing never actually branched are never
+            # queued for a teacher generation (see the matching teacher_acc
+            # fallback above), so they have no privileged teacher prefix.
+            # Fall back to an empty prefix rather than None.
+            teacher_prefix = (
+                node.teacher_ids
+                if node.teacher_ids is not None
+                else torch.empty(0, dtype=torch.long)
+            )
+
             batch.append({
                 "correctness_advantage": correctness_advantage,
                 "H_target": H_target,
                 "reward_mask": reward_mask,
                 "input_ids": input_ids,
                 "h_target_ratio": ratio,
-                "teacher_prefix": node.teacher_ids
+                "teacher_prefix": teacher_prefix,
             })
 
     def __freeze_old_policy_logits__(self, mini_batch):
@@ -244,20 +273,50 @@ class TreeRewardManager:
 
         return (loss_per_token * masks).sum()
 
-    def process_batch(batch, mini_batch_size, epoch=3):
-        batch = sorted(batch, key=lambda x: len(x["input_ids"]))
+    @staticmethod
+    def bucket_by_token_budget(batch, max_tokens_per_mini_batch):
+        """
+        Sort by length, then greedily group rows so that each mini-batch's
+        padded size (rows * longest row in that mini-batch) stays within
+        max_tokens_per_mini_batch. Unlike a fixed row count, this keeps the
+        longest sequences from ending up in equally large mini-batches as
+        the shortest ones, which is what was blowing up backward-pass
+        memory on the full-vocab logits tensor.
+        """
+        sorted_batch = sorted(batch, key=lambda x: len(x["input_ids"]))
 
+        mini_batches = []
+        current = []
+        current_max_len = 0
+        for item in sorted_batch:
+            item_len = len(item["input_ids"])
+            candidate_max_len = max(current_max_len, item_len)
+            candidate_padded_tokens = (len(current) + 1) * candidate_max_len
+
+            if current and candidate_padded_tokens > max_tokens_per_mini_batch:
+                mini_batches.append(current)
+                current = []
+                candidate_max_len = item_len
+
+            current.append(item)
+            current_max_len = candidate_max_len
+
+        if current:
+            mini_batches.append(current)
+
+        return mini_batches
+
+    def process_batch(batch, max_tokens_per_mini_batch, epoch=3):
         n_total_tokens = sum(
             int(item["reward_mask"].sum().item())
             for item in batch
         )
-        
-        mini_batches = []
-        for start in range(0, len(batch), mini_batch_size):
-            end_idx = min(start + mini_batch_size, len(batch))
-            
-            mini_batches.append(batch[start:end_idx])
-            
+
+        mini_batches = TreeRewardManager.bucket_by_token_budget(
+            batch,
+            max_tokens_per_mini_batch,
+        )
+
         return n_total_tokens, mini_batches
             
         

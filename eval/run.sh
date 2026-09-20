@@ -39,16 +39,17 @@ export RAY_DEDUP_LOGS=0
 
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 
-BASE_MODEL="Qwen/Qwen3-8B"
-EXP_DIR="/scratch/pioneer/users/ptd18/eval/aime24/Qwuen3-8B/base"
+#BASE_MODEL="Qwen/Qwen3-1.7B"
+BASE_MODEL="../checkpoints/final-qwen3-1.7B-toe-opsd-openthoughts-math-30k"
 
-# evaluate base model performance
-NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python evaluate_math.py \
+EXP_DIR="/scratch/pioneer/users/ptd18/eval/aime25/Qwen3-1.7B-temp-1.1/checkpoint-500"
+
+NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 python evaluate_math.py \
     --base_model "$BASE_MODEL" \
-    --dataset "aime24" \
+    --dataset "aime25" \
     --val_n 12 \
     --temperature 1.0 \
-    --tensor_parallel_size 8 \
-    --max_model_len 38912 \
+    --tensor_parallel_size 2 \
+    --max_model_len 10000 \
     --top_p 0.95
 wait 

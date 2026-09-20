@@ -19,6 +19,11 @@ CHECKPOINT_STEP = 500
 UPDATE_STEP = 3
 NUM_STEPS = None
 
+# AIME25 eval, run every CHECKPOINT_STEP steps on the rollout actor's
+# already-loaded engine (no extra GPUs needed).
+EVAL_VAL_N = 4
+EVAL_MAX_NEW_TOKENS = 16000
+
 # Number of already completed batches.
 # For example, 500 means batches 0 through 499 were already completed.
 START_STEP = 0
@@ -364,8 +369,15 @@ if __name__ == "__main__":
                 "rollout/total_response_length": stats[
                     "rollout/total_response_length"
                 ],
+                "rollout/avg_response_length": stats[
+                    "rollout/avg_response_length"
+                ],
                 "rollout/avg_rollouts_per_prompt": stats[
                     "rollout/avg_rollouts_per_prompt"
+                ],
+                "rollout/eos_rate": stats["rollout/eos_rate"],
+                "rollout/truncated_rate": stats[
+                    "rollout/truncated_rate"
                 ],
                 "rollout/avg_response_entropy": stats[
                     "rollout/avg_response_entropy"
@@ -398,6 +410,31 @@ if __name__ == "__main__":
                     CHECKPOINT_DIR,
                     f"checkpoint-{current_step}",
                 )
+            )
+
+            debug("=" * 80)
+            debug("RUNNING AIME25 EVAL")
+            eval_stats = controller.eval_aime25(
+                val_n=EVAL_VAL_N,
+                max_new_tokens=EVAL_MAX_NEW_TOKENS,
+            )
+            debug("DONE AIME25 EVAL")
+            debug(eval_stats)
+            debug("=" * 80)
+
+            wandb.log(
+                {
+                    "eval/aime25/average_at_n_pct": eval_stats[
+                        "average_at_n_pct"
+                    ],
+                    "eval/aime25/pass_at_n_pct": eval_stats[
+                        "pass_at_n_pct"
+                    ],
+                    "eval/aime25/majority_vote_at_n_pct": eval_stats[
+                        "majority_vote_at_n_pct"
+                    ],
+                },
+                step=current_step,
             )
 
     controller.save_and_sync(
